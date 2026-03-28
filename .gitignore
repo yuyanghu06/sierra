@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Environment
+.env
+.env.*
+
+# Python venv (Home Assistant)
+venv/
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+._*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# Tauri
+src-tauri/target/
+*.deb
+*.dmg
+*.AppImage
+*.msi
+*.exe
+*.nsis
+
+# Logs
+*.log
+
+# TypeScript
+*.tsbuildinfo
+
+# Vite
+*.local
+
+# Claude Code
+.claude/
