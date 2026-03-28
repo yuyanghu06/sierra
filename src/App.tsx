@@ -2,9 +2,11 @@ import { useState, useEffect, useCallback } from "react";
 import { checkOllamaHealth } from "./commands/chat";
 import { getAllDevices, callDeviceAction, getDeviceCount, checkHaHealth, type DeviceInfo } from "./commands/devices";
 import { getActiveModel } from "./commands/config";
+import { checkDependencies } from "./commands/setup";
 import ChatView from "./views/ChatView";
 import DevicesView from "./views/DevicesView";
 import SettingsView from "./views/SettingsView";
+import SetupView from "./views/SetupView";
 
 type View = "chat" | "devices" | "settings";
 type PanelTab = "active" | "all" | "rooms";
@@ -64,6 +66,7 @@ function DevicePanelCard({
 }
 
 function App() {
+  const [setupComplete, setSetupComplete] = useState<boolean | null>(null);
   const [activeView, setActiveView] = useState<View>("chat");
   const [ollamaHealthy, setOllamaHealthy] = useState<boolean | null>(null);
   const [haHealthy, setHaHealthy] = useState<boolean | null>(null);
@@ -107,6 +110,18 @@ function App() {
   }, []);
 
   useEffect(() => {
+    checkDependencies()
+      .then((status) => {
+        setSetupComplete(status.ollama_installed && status.home_assistant_installed);
+      })
+      .catch(() => {
+        // If check fails, assume setup is needed but don't block the app
+        setSetupComplete(true);
+      });
+  }, []);
+
+  useEffect(() => {
+    if (setupComplete !== true) return;
     pollHealth();
     loadDevices();
     const interval = setInterval(() => {
@@ -122,7 +137,7 @@ function App() {
       clearInterval(interval);
       window.removeEventListener("focus", handleFocus);
     };
-  }, [pollHealth, loadDevices]);
+  }, [setupComplete, pollHealth, loadDevices]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -164,6 +179,36 @@ function App() {
       if (!grouped.has(room)) grouped.set(room, []);
       grouped.get(room)!.push(d);
     }
+  }
+
+  // Show loading while checking dependencies
+  if (setupComplete === null) {
+    return (
+      <div className="app-shell">
+        <div className="ambient-bg">
+          <div className="ambient-orb ambient-orb-1" />
+          <div className="ambient-orb ambient-orb-2" />
+        </div>
+        <div className="setup-loading">
+          <img src="/sierra-logo.png" alt="Sierra" width="48" height="48" />
+          <p className="setup-loading-text">Loading...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Show setup wizard if dependencies are missing
+  if (setupComplete === false) {
+    return (
+      <div className="app-shell">
+        <div className="ambient-bg">
+          <div className="ambient-orb ambient-orb-1" />
+          <div className="ambient-orb ambient-orb-2" />
+          <div className="ambient-orb ambient-orb-3" />
+        </div>
+        <SetupView onComplete={() => setSetupComplete(true)} />
+      </div>
+    );
   }
 
   return (

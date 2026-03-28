@@ -9,6 +9,7 @@ mod tools;
 use services::ha_client::HaRestClient;
 use services::mcp_server::{self, McpServerState};
 use services::ollama::OllamaService;
+use services::process_manager::ProcessManager;
 use services::tool_executor::HaToolExecutor;
 use state::AppState;
 use std::sync::{Arc, Mutex};
@@ -49,6 +50,34 @@ pub fn run() {
                 ha_client: ha_client.clone(),
             });
 
+            // Create the process manager
+            let app_data_dir = app
+                .handle()
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+            let log_dir = {
+                #[cfg(target_os = "macos")]
+                {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                    std::path::PathBuf::from(home).join("Library/Logs/Sierra")
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    let appdata =
+                        std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+                    std::path::PathBuf::from(appdata).join("Sierra\\logs")
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                {
+                    app_data_dir.join("logs")
+                }
+            };
+
+            let process_manager = Arc::new(ProcessManager::new(app_data_dir, log_dir));
+
+            // Manage both AppState and ProcessManager as separate Tauri states
             app.manage(AppState {
                 conversation: Mutex::new(Vec::new()),
                 llm: RwLock::new(Box::new(ollama)),
@@ -57,6 +86,8 @@ pub fn run() {
                 tool_executor: RwLock::new(tool_executor),
                 config: RwLock::new(cfg),
             });
+
+            app.manage(process_manager.clone());
 
             let ha_client_setup = ha_client.clone();
             let device_cache_setup = device_cache.clone();
@@ -77,7 +108,24 @@ pub fn run() {
                 }
             });
 
+            // Start health monitoring for managed processes
+            let pm_monitor = process_manager.clone();
+            tauri::async_runtime::spawn(async move {
+                pm_monitor.start_monitoring();
+            });
+
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                if let Some(pm) = window.try_state::<Arc<ProcessManager>>() {
+                    let pm = pm.inner().clone();
+                    // Block briefly to ensure processes are stopped
+                    tauri::async_runtime::block_on(async {
+                        pm.shutdown_all().await;
+                    });
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::system::ping,
@@ -97,7 +145,15 @@ pub fn run() {
             commands::settings::save_config,
             commands::settings::test_ha_connection,
             commands::settings::get_active_model,
+            commands::setup::check_dependencies,
+            commands::setup::install_ollama,
+            commands::setup::install_home_assistant,
+            commands::setup::pull_model,
+            commands::setup::get_service_status,
+            commands::setup::restart_service,
+            commands::setup::start_services,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+

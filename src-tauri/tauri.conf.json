@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/nicegui/tauri-v2-schema/refs/heads/main/tauri.conf.json",
   "productName": "Sierra",
   "version": "0.1.0",
-  "identifier": "com.localhomeassistant.desktop",
+  "identifier": "com.sierra.desktop",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -24,6 +24,7 @@
     }
   },
   "bundle": {
+    "active": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -31,6 +32,20 @@
       "icons/icon.icns",
       "icons/icon.ico",
       "icons/icon.png"
-    ]
+    ],
+    "targets": "all",
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "dmg": {
+        "appPosition": { "x": 180, "y": 170 },
+        "applicationFolderPosition": { "x": 480, "y": 170 },
+        "windowSize": { "width": 660, "height": 400 }
+      }
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "both"
+      }
+    }
   }
 }
