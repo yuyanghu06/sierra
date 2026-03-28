@@ -9,9 +9,10 @@ import {
   type InstallProgressEvent,
   type PullProgressEvent,
 } from "../commands/setup";
-import { listModels } from "../commands/chat";
+import { listModels, checkOllamaHealth } from "../commands/chat";
+import { saveConfig, getConfig } from "../commands/config";
 
-type SetupStep = "check" | "install" | "model" | "ready";
+type SetupStep = "check" | "install" | "startingOllama" | "model" | "ready";
 
 interface StepState {
   ollamaInstalling: boolean;
@@ -29,8 +30,9 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
   const [step, setStep] = useState<SetupStep>("check");
   const [deps, setDeps] = useState<DependencyStatus | null>(null);
   const [models, setModels] = useState<string[]>([]);
-  const [selectedModel, setSelectedModel] = useState("qwen3.5:4b");
+  const [selectedModel, setSelectedModel] = useState("");
   const [customModel, setCustomModel] = useState("");
+  const [modelReady, setModelReady] = useState(false);
   const [startingServices, setStartingServices] = useState(false);
   const [stepState, setStepState] = useState<StepState>({
     ollamaInstalling: false,
@@ -54,9 +56,8 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
       setDeps(status);
 
       if (status.ollama_installed && status.home_assistant_installed) {
-        // Both installed — skip to model step
-        setStep("model");
-        loadModels();
+        // Both installed — start Ollama and go to model step
+        await ensureOllamaRunningThenModelStep();
       } else {
         setStep("install");
       }
@@ -66,10 +67,47 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
     }
   }
 
+  async function ensureOllamaRunningThenModelStep() {
+    setStep("startingOllama");
+
+    // First try starting services so Ollama is running
+    try {
+      await startServices();
+    } catch {
+      // May fail if services aren't installed as managed — that's ok
+    }
+
+    // Poll until Ollama is healthy (up to 30s)
+    let healthy = false;
+    for (let i = 0; i < 30; i++) {
+      try {
+        healthy = await checkOllamaHealth();
+        if (healthy) break;
+      } catch {
+        // ignore
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+
+    if (!healthy) {
+      // Ollama didn't come up — still go to model step, user may need to start it
+      setStep("model");
+      return;
+    }
+
+    // Ollama is running, load models and go to model step
+    await loadModels();
+    setStep("model");
+  }
+
   async function loadModels() {
     try {
       const list = await listModels();
       setModels(list);
+      if (list.length > 0 && !selectedModel) {
+        setSelectedModel(list[0]);
+        setModelReady(true);
+      }
     } catch {
       setModels([]);
     }
@@ -180,14 +218,15 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
     }
   }
 
-  function handleContinueToModel() {
-    setStep("model");
-    loadModels();
+  async function handleContinueToModel() {
+    await ensureOllamaRunningThenModelStep();
   }
 
   async function handlePullModel() {
     const modelName = customModel.trim() || selectedModel;
+    if (!modelName) return;
 
+    setModelReady(false);
     setStepState((s) => ({
       ...s,
       modelPulling: true,
@@ -224,6 +263,15 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
             break;
         }
       });
+
+      // Model pulled successfully — select it and mark ready
+      const pulledName = customModel.trim() || selectedModel;
+      setSelectedModel(pulledName);
+      setCustomModel("");
+      setModelReady(true);
+
+      // Refresh model list
+      await loadModels();
     } catch (e) {
       setStepState((s) => ({
         ...s,
@@ -234,18 +282,27 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
     }
   }
 
+  function handleSelectExistingModel(model: string) {
+    setSelectedModel(model);
+    setModelReady(true);
+  }
+
   async function handleFinish() {
     setStartingServices(true);
     try {
+      // Save the selected model to config
+      const cfg = await getConfig();
+      await saveConfig({
+        ...cfg,
+        ollama_model: selectedModel || null,
+      });
+
+      // Start remaining services (HA if not already running)
       await startServices();
     } catch {
       // Services will start on their own
     }
     setStartingServices(false);
-    onComplete();
-  }
-
-  function handleSkipModel() {
     onComplete();
   }
 
@@ -274,6 +331,16 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
             <div className="setup-checking">
               <span className="setup-spinner" />
               <span>Checking system...</span>
+            </div>
+          </div>
+        )}
+
+        {/* Step: Starting Ollama */}
+        {step === "startingOllama" && (
+          <div className="setup-body">
+            <div className="setup-checking">
+              <span className="setup-spinner" />
+              <span>Starting Ollama...</span>
             </div>
           </div>
         )}
@@ -364,9 +431,6 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
               >
                 Continue
               </button>
-              <button className="form-btn" onClick={onComplete}>
-                Skip Setup
-              </button>
             </div>
           </div>
         )}
@@ -378,10 +442,10 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
               <h3 className="setup-section-title">Choose a Model</h3>
               <p className="setup-section-desc">
                 Select an LLM model to power Sierra. Models with tool calling
-                support work best.
+                support work best. You need at least one model to continue.
               </p>
 
-              {models.length > 0 ? (
+              {models.length > 0 && (
                 <div className="setup-model-list">
                   <label className="settings-field-label" htmlFor="setup-model">
                     Installed Models
@@ -390,8 +454,13 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
                     id="setup-model"
                     className="form-select"
                     value={selectedModel}
-                    onChange={(e) => setSelectedModel(e.target.value)}
+                    onChange={(e) => handleSelectExistingModel(e.target.value)}
                   >
+                    {!selectedModel && (
+                      <option value="" disabled>
+                        Select a model...
+                      </option>
+                    )}
                     {models.map((m) => (
                       <option key={m} value={m}>
                         {m}
@@ -399,15 +468,13 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
                     ))}
                   </select>
                 </div>
-              ) : (
-                <p className="setup-section-desc">
-                  No models found. Enter a model name to download.
-                </p>
               )}
 
               <div className="setup-model-pull">
                 <label className="settings-field-label" htmlFor="setup-custom-model">
-                  Download a Model
+                  {models.length > 0
+                    ? "Or download a different model"
+                    : "Download a Model"}
                 </label>
                 <div className="setup-model-pull-row">
                   <input
@@ -421,7 +488,10 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
                   <button
                     className="form-btn form-btn-primary"
                     onClick={handlePullModel}
-                    disabled={stepState.modelPulling}
+                    disabled={
+                      stepState.modelPulling ||
+                      (!customModel.trim() && !selectedModel)
+                    }
                   >
                     {stepState.modelPulling ? "Downloading..." : "Download"}
                   </button>
@@ -439,12 +509,9 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
               <button
                 className="form-btn form-btn-primary"
                 onClick={handleFinish}
-                disabled={startingServices}
+                disabled={!modelReady || startingServices || stepState.modelPulling}
               >
                 {startingServices ? "Starting..." : "Get Started"}
-              </button>
-              <button className="form-btn" onClick={handleSkipModel}>
-                Skip
               </button>
             </div>
           </div>

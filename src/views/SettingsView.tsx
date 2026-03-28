@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { listModels, checkOllamaHealth } from "../commands/chat";
-import { getConfig, saveConfig, testHaConnection } from "../commands/config";
+import { getConfig, saveConfig } from "../commands/config";
+import { pullModel, type PullProgressEvent } from "../commands/setup";
 
 export default function SettingsView() {
   const [haUrl, setHaUrl] = useState("http://localhost:8123");
@@ -8,11 +9,18 @@ export default function SettingsView() {
   const [ollamaUrl, setOllamaUrl] = useState("http://localhost:11434");
   const [models, setModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState("qwen3.5:4b");
+  const [savedModel, setSavedModel] = useState("qwen3.5:4b");
   const [ollamaHealthy, setOllamaHealthy] = useState<boolean | null>(null);
   const [haTestResult, setHaTestResult] = useState<boolean | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [reduceTransparency, setReduceTransparency] = useState(false);
+
+  // Model download state
+  const [pulling, setPulling] = useState(false);
+  const [pullProgress, setPullProgress] = useState("");
+  const [pullError, setPullError] = useState<string | null>(null);
+  const [modelDownloaded, setModelDownloaded] = useState(true);
 
   useEffect(() => {
     loadConfig();
@@ -30,7 +38,10 @@ export default function SettingsView() {
       if (cfg.ha_url) setHaUrl(cfg.ha_url);
       if (cfg.ha_token) setHaToken(cfg.ha_token);
       if (cfg.ollama_url) setOllamaUrl(cfg.ollama_url);
-      if (cfg.ollama_model) setSelectedModel(cfg.ollama_model);
+      if (cfg.ollama_model) {
+        setSelectedModel(cfg.ollama_model);
+        setSavedModel(cfg.ollama_model);
+      }
     } catch {
       // Use defaults
     }
@@ -40,8 +51,10 @@ export default function SettingsView() {
     try {
       const list = await listModels();
       setModels(list);
+      return list;
     } catch {
       setModels([]);
+      return [];
     }
   }
 
@@ -57,6 +70,7 @@ export default function SettingsView() {
   async function handleTestHa() {
     setHaTestResult(null);
     try {
+      const { testHaConnection } = await import("../commands/config");
       const result = await testHaConnection(haUrl, haToken);
       setHaTestResult(result);
     } catch {
@@ -64,7 +78,60 @@ export default function SettingsView() {
     }
   }
 
+  function handleModelChange(model: string) {
+    setSelectedModel(model);
+    // If the new model is already in the local model list, it's downloaded
+    setModelDownloaded(models.includes(model));
+    setPullError(null);
+    setPullProgress("");
+  }
+
+  async function handlePullSelectedModel() {
+    if (!selectedModel) return;
+
+    setPulling(true);
+    setPullProgress("Starting download...");
+    setPullError(null);
+    setModelDownloaded(false);
+
+    try {
+      await pullModel(selectedModel, (event: PullProgressEvent) => {
+        switch (event.event) {
+          case "downloading":
+            setPullProgress(`Downloading... ${Math.round(event.data.percent)}%`);
+            break;
+          case "verifying":
+            setPullProgress("Verifying...");
+            break;
+          case "completed":
+            setPullProgress("Downloaded");
+            break;
+          case "failed":
+            setPullError(event.data.error);
+            setPullProgress("");
+            break;
+        }
+      });
+
+      setModelDownloaded(true);
+      setPulling(false);
+
+      // Refresh model list
+      await loadModels();
+    } catch (e) {
+      setPulling(false);
+      setPullError(String(e));
+    }
+  }
+
   async function handleSave() {
+    // If the model changed and isn't downloaded yet, pull it first
+    if (selectedModel !== savedModel && !modelDownloaded) {
+      await handlePullSelectedModel();
+      // If pull failed, don't save
+      if (!modelDownloaded) return;
+    }
+
     setSaving(true);
     setSaveSuccess(false);
     try {
@@ -74,6 +141,7 @@ export default function SettingsView() {
         ollama_url: ollamaUrl || null,
         ollama_model: selectedModel || null,
       });
+      setSavedModel(selectedModel);
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 3000);
       checkHealth();
@@ -82,6 +150,9 @@ export default function SettingsView() {
     }
     setSaving(false);
   }
+
+  const modelChanged = selectedModel !== savedModel;
+  const needsDownload = modelChanged && !modelDownloaded;
 
   return (
     <div className="settings-view">
@@ -167,19 +238,39 @@ export default function SettingsView() {
 
         <div className="settings-field">
           <label className="settings-field-label" htmlFor="ollama-model">Model</label>
-          <select
-            id="ollama-model"
-            className="form-select"
-            value={selectedModel}
-            onChange={(e) => setSelectedModel(e.target.value)}
-          >
-            {models.length === 0 && (
-              <option value={selectedModel}>{selectedModel}</option>
+          <div className="settings-model-row">
+            <select
+              id="ollama-model"
+              className="form-select"
+              value={selectedModel}
+              onChange={(e) => handleModelChange(e.target.value)}
+              disabled={pulling}
+            >
+              {models.length === 0 && (
+                <option value={selectedModel}>{selectedModel}</option>
+              )}
+              {models.map((m) => (
+                <option key={m} value={m}>{m}</option>
+              ))}
+            </select>
+            {needsDownload && !pulling && (
+              <button
+                className="form-btn form-btn-primary"
+                onClick={handlePullSelectedModel}
+              >
+                Download
+              </button>
             )}
-            {models.map((m) => (
-              <option key={m} value={m}>{m}</option>
-            ))}
-          </select>
+          </div>
+          {pulling && (
+            <div className="settings-pull-progress">{pullProgress}</div>
+          )}
+          {pullError && (
+            <div className="settings-pull-error">{pullError}</div>
+          )}
+          {modelChanged && modelDownloaded && (
+            <div className="settings-pull-ready">Model ready — save to apply</div>
+          )}
         </div>
 
         <div className="settings-btn-row">
@@ -193,9 +284,15 @@ export default function SettingsView() {
           <button
             className="form-btn form-btn-primary"
             onClick={handleSave}
-            disabled={saving}
+            disabled={saving || pulling}
           >
-            {saving ? "Saving..." : "Save Settings"}
+            {pulling
+              ? "Downloading model..."
+              : saving
+                ? "Saving..."
+                : needsDownload
+                  ? "Download & Save"
+                  : "Save Settings"}
           </button>
           {saveSuccess && (
             <span className="settings-status">

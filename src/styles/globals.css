@@ -1130,6 +1130,34 @@ body {
   margin-top: 8px;
 }
 
+.settings-model-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.settings-model-row .form-select {
+  flex: 1;
+}
+
+.settings-pull-progress {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 6px;
+}
+
+.settings-pull-error {
+  font-size: 12px;
+  color: rgba(200, 60, 50, 0.85);
+  margin-top: 6px;
+}
+
+.settings-pull-ready {
+  font-size: 12px;
+  color: rgba(60, 120, 70, 0.8);
+  margin-top: 6px;
+}
+
 /* ============================================
    Focus & Accessibility
    ============================================ */
