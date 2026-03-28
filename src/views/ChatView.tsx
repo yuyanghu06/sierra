@@ -1,16 +1,47 @@
 import { useState, useRef, useEffect } from "react";
 import { sendChatMessage, clearConversation } from "../commands/chat";
 
+interface ToolCallInfo {
+  id: string;
+  toolName: string;
+  success: boolean | null;
+  message: string | null;
+}
+
 interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
   isStreaming: boolean;
+  toolCalls: ToolCallInfo[];
 }
 
 let messageCounter = 0;
 function nextId(): string {
   return `msg-${++messageCounter}`;
+}
+
+function ToolCallPill({ tc }: { tc: ToolCallInfo }) {
+  const isPending = tc.success === null;
+  const isSuccess = tc.success === true;
+
+  const className = isPending
+    ? "tool-pill tool-pill-pending"
+    : isSuccess
+      ? "tool-pill tool-pill-success"
+      : "tool-pill tool-pill-error";
+
+  const icon = isPending ? "\u2026" : isSuccess ? "\u2713" : "\u2717";
+  const label = isPending
+    ? tc.toolName
+    : `${tc.toolName.replace("_", ".")} executed`;
+
+  return (
+    <span className={className}>
+      <span className="tool-pill-icon">{icon}</span>
+      <span className="tool-pill-label">{label}</span>
+    </span>
+  );
 }
 
 export default function ChatView() {
@@ -42,6 +73,7 @@ export default function ChatView() {
       role: "user",
       content: text,
       isStreaming: false,
+      toolCalls: [],
     };
     const assistantId = nextId();
     const assistantMsg: Message = {
@@ -49,6 +81,7 @@ export default function ChatView() {
       role: "assistant",
       content: "",
       isStreaming: true,
+      toolCalls: [],
     };
 
     setMessages((prev) => [...prev, userMsg, assistantMsg]);
@@ -62,6 +95,47 @@ export default function ChatView() {
                 ? { ...m, content: m.content + event.data }
                 : m,
             ),
+          );
+        } else if (event.event === "toolCallStart") {
+          const tcId = nextId();
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId
+                ? {
+                    ...m,
+                    toolCalls: [
+                      ...m.toolCalls,
+                      {
+                        id: tcId,
+                        toolName: event.data.toolName,
+                        success: null,
+                        message: null,
+                      },
+                    ],
+                  }
+                : m,
+            ),
+          );
+        } else if (event.event === "toolCallResult") {
+          setMessages((prev) =>
+            prev.map((m) => {
+              if (m.id !== assistantId) return m;
+              const updatedCalls = [...m.toolCalls];
+              for (let i = updatedCalls.length - 1; i >= 0; i--) {
+                if (
+                  updatedCalls[i].toolName === event.data.toolName &&
+                  updatedCalls[i].success === null
+                ) {
+                  updatedCalls[i] = {
+                    ...updatedCalls[i],
+                    success: event.data.success,
+                    message: event.data.message,
+                  };
+                  break;
+                }
+              }
+              return { ...m, toolCalls: updatedCalls };
+            }),
           );
         } else if (event.event === "done") {
           setMessages((prev) =>
@@ -127,7 +201,7 @@ export default function ChatView() {
         {messages.map((msg) => (
           <div key={msg.id} className={`chat-bubble chat-bubble-${msg.role}`}>
             <div className="chat-bubble-content">
-              {msg.isStreaming && msg.content === "" ? (
+              {msg.isStreaming && msg.content === "" && msg.toolCalls.length === 0 ? (
                 <span className="chat-thinking">
                   Thinking<span className="chat-thinking-dots" />
                 </span>
@@ -138,6 +212,13 @@ export default function ChatView() {
                 </>
               )}
             </div>
+            {msg.toolCalls.length > 0 && (
+              <div className="chat-tool-calls">
+                {msg.toolCalls.map((tc) => (
+                  <ToolCallPill key={tc.id} tc={tc} />
+                ))}
+              </div>
+            )}
           </div>
         ))}
         <div ref={messagesEndRef} />

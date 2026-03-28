@@ -2,6 +2,8 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 
 export type ChatEvent =
   | { event: "token"; data: string }
+  | { event: "toolCallStart"; data: { toolName: string } }
+  | { event: "toolCallResult"; data: { toolName: string; success: boolean; message: string } }
   | { event: "done"; data: { fullResponse: string } }
   | { event: "error"; data: string };
 

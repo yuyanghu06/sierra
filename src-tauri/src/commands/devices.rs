@@ -1,5 +1,4 @@
 use crate::devices::{DeviceInfo, RoomInfo};
-use crate::services::ha_client::EntityState;
 use crate::state::AppState;
 
 #[tauri::command]
@@ -45,6 +44,8 @@ pub async fn call_device_action(
 ) -> Result<(), String> {
     state
         .ha
+        .read()
+        .await
         .call_service(&domain, &service, &entity_id, data)
         .await
 }
@@ -53,14 +54,16 @@ pub async fn call_device_action(
 pub async fn check_ha_health(
     state: tauri::State<'_, AppState>,
 ) -> Result<bool, String> {
-    Ok(state.ha.is_healthy().await)
+    Ok(state.ha.read().await.is_healthy().await)
 }
 
 #[tauri::command]
 pub async fn refresh_devices(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<DeviceInfo>, String> {
-    let states = state.ha.get_all_states().await?;
+    let ha = state.ha.read().await;
+    let states = ha.get_all_states().await?;
+    drop(ha);
     state.device_cache.populate(states).await;
     Ok(state.device_cache.get_all_devices().await)
 }

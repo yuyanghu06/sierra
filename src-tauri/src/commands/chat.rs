@@ -48,13 +48,13 @@ pub async fn send_chat_message(
     let messages = messages_with_system;
 
     // Check if HA is healthy — if so, use tool calling; otherwise plain chat
-    let ha_available = state.ha.is_healthy().await;
+    let ha_available = state.ha.read().await.is_healthy().await;
 
     if ha_available {
         // Tool-calling path
         let tools = registry::tools_for_ollama();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<LlmEvent>(32);
-        let tool_executor = state.tool_executor.clone();
+        let tool_executor = state.tool_executor.read().await.clone();
 
         let on_event_clone = on_event.clone();
         let relay_handle = tokio::spawn(async move {
@@ -86,16 +86,15 @@ pub async fn send_chat_message(
             full_response
         });
 
-        let result = state
-            .llm
+        let llm = state.llm.read().await;
+        let result = llm
             .chat_with_tools(messages, tools, tool_executor.as_ref(), tx)
             .await;
+        drop(llm);
 
         match result {
             Ok(updated_messages) => {
                 let _full_response = relay_handle.await.map_err(|e| e.to_string())?;
-
-                // Replace conversation with the updated messages (includes tool rounds)
                 let mut conv = state.conversation.lock().map_err(|e| e.to_string())?;
                 *conv = updated_messages;
             }
@@ -125,10 +124,12 @@ pub async fn send_chat_message(
             full_response
         });
 
-        if let Err(e) = state.llm.chat_stream(messages, tx).await {
+        let llm = state.llm.read().await;
+        if let Err(e) = llm.chat_stream(messages, tx).await {
             let _ = on_event.send(ChatEvent::Error(e.clone()));
             return Err(e);
         }
+        drop(llm);
 
         let full_response = relay_handle.await.map_err(|e| e.to_string())?;
 
@@ -152,10 +153,10 @@ pub fn clear_conversation(state: tauri::State<'_, AppState>) -> Result<(), Strin
 
 #[tauri::command]
 pub async fn check_ollama_health(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    Ok(state.llm.is_healthy().await)
+    Ok(state.llm.read().await.is_healthy().await)
 }
 
 #[tauri::command]
 pub async fn list_models(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
-    state.llm.list_models().await
+    state.llm.read().await.list_models().await
 }

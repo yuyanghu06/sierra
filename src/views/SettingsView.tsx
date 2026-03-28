@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { listModels, checkOllamaHealth } from "../commands/chat";
+import { getConfig, saveConfig, testHaConnection } from "../commands/config";
 
 export default function SettingsView() {
   const [haUrl, setHaUrl] = useState("http://localhost:8123");
@@ -8,9 +9,13 @@ export default function SettingsView() {
   const [models, setModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState("qwen3.5:4b");
   const [ollamaHealthy, setOllamaHealthy] = useState<boolean | null>(null);
+  const [haTestResult, setHaTestResult] = useState<boolean | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveSuccess, setSaveSuccess] = useState(false);
   const [reduceTransparency, setReduceTransparency] = useState(false);
 
   useEffect(() => {
+    loadConfig();
     loadModels();
     checkHealth();
   }, []);
@@ -18,6 +23,18 @@ export default function SettingsView() {
   useEffect(() => {
     document.documentElement.classList.toggle("reduce-transparency", reduceTransparency);
   }, [reduceTransparency]);
+
+  async function loadConfig() {
+    try {
+      const cfg = await getConfig();
+      if (cfg.ha_url) setHaUrl(cfg.ha_url);
+      if (cfg.ha_token) setHaToken(cfg.ha_token);
+      if (cfg.ollama_url) setOllamaUrl(cfg.ollama_url);
+      if (cfg.ollama_model) setSelectedModel(cfg.ollama_model);
+    } catch {
+      // Use defaults
+    }
+  }
 
   async function loadModels() {
     try {
@@ -35,6 +52,35 @@ export default function SettingsView() {
     } catch {
       setOllamaHealthy(false);
     }
+  }
+
+  async function handleTestHa() {
+    setHaTestResult(null);
+    try {
+      const result = await testHaConnection(haUrl, haToken);
+      setHaTestResult(result);
+    } catch {
+      setHaTestResult(false);
+    }
+  }
+
+  async function handleSave() {
+    setSaving(true);
+    setSaveSuccess(false);
+    try {
+      await saveConfig({
+        ha_url: haUrl || null,
+        ha_token: haToken || null,
+        ollama_url: ollamaUrl || null,
+        ollama_model: selectedModel || null,
+      });
+      setSaveSuccess(true);
+      setTimeout(() => setSaveSuccess(false), 3000);
+      checkHealth();
+    } catch {
+      // Save failed
+    }
+    setSaving(false);
   }
 
   return (
@@ -73,7 +119,15 @@ export default function SettingsView() {
         </div>
 
         <div className="settings-btn-row">
-          <button className="form-btn form-btn-primary">Test Connection</button>
+          <button className="form-btn form-btn-primary" onClick={handleTestHa}>
+            Test Connection
+          </button>
+          {haTestResult !== null && (
+            <span className="settings-status">
+              <span className={`health-dot ${haTestResult ? "health-dot-ok" : "health-dot-error"}`} />
+              <span>{haTestResult ? "Connected" : "Connection failed"}</span>
+            </span>
+          )}
         </div>
       </div>
 
@@ -130,6 +184,25 @@ export default function SettingsView() {
 
         <div className="settings-btn-row">
           <button className="form-btn" onClick={loadModels}>Refresh Models</button>
+        </div>
+      </div>
+
+      {/* Save */}
+      <div className="settings-section">
+        <div className="settings-btn-row">
+          <button
+            className="form-btn form-btn-primary"
+            onClick={handleSave}
+            disabled={saving}
+          >
+            {saving ? "Saving..." : "Save Settings"}
+          </button>
+          {saveSuccess && (
+            <span className="settings-status">
+              <span className="health-dot health-dot-ok" />
+              <span>Settings saved</span>
+            </span>
+          )}
         </div>
       </div>
 
