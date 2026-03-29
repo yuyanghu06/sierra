@@ -118,12 +118,56 @@ fn detect_ollama() -> (bool, Option<String>) {
 }
 
 fn detect_ha(_app_data_dir: &PathBuf) -> (bool, Option<String>) {
-    // 1. Check managed venv (space-free path — see ha_venv_dir() for rationale)
-    let venv = ha_venv_dir();
-
-    #[cfg(target_os = "macos")]
-    let hass = venv.join("bin/hass");
+    // On Windows, HA runs inside WSL — check there instead of native PATH.
+    // hass.exe from a Windows-native venv will always refuse to start:
+    // "Home Assistant only supports Linux, OSX and Windows using WSL"
     #[cfg(target_os = "windows")]
+    {
+        let check = Command::new("wsl")
+            .args(["--", "bash", "-c", "test -f ~/.sierra/ha-venv/bin/hass"])
+            .output();
+        return match check {
+            Ok(output) => (output.status.success(), None),
+            Err(_) => (false, None), // WSL not available or not installed
+        };
+    }
+
+    // macOS / Linux: check the managed venv first, then system PATH.
+    #[cfg(not(target_os = "windows"))]
+    {
+        let venv = ha_venv_dir();
+
+        #[cfg(target_os = "macos")]
+        let hass = venv.join("bin/hass");
+        #[cfg(not(target_os = "macos"))]
+        let hass = venv.join("bin/hass");
+
+        if hass.exists() {
+            let result = Command::new(&hass).arg("--version").output();
+            return match result {
+                Ok(output) if output.status.success() => {
+                    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    (true, if version.is_empty() { None } else { Some(version) })
+                }
+                _ => (true, None), // Binary exists even if --version fails
+            };
+        }
+
+        if let Ok(output) = Command::new("which").arg("hass").output() {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !path.is_empty() {
+                    if let Ok(ver_output) = Command::new(&path).arg("--version").output() {
+                        if ver_output.status.success() {
+                            let version =
+                                String::from_utf8_lossy(&ver_output.stdout).trim().to_string();
+                            return (true, if version.is_empty() { None } else { Some(version) });
+                        }
     let hass = venv.join("Scripts\\hass.exe");
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let hass = venv.join("bin/hass");
@@ -151,13 +195,13 @@ fn detect_ha(_app_data_dir: &PathBuf) -> (bool, Option<String>) {
                         let version = String::from_utf8_lossy(&ver_output.stdout).trim().to_string();
                         return (true, if version.is_empty() { None } else { Some(version) });
                     }
+                    return (true, None);
                 }
-                return (true, None);
             }
         }
-    }
 
-    (false, None)
+        (false, None)
+    }
 }
 
 fn detect_python() -> (bool, Option<String>) {
@@ -473,8 +517,84 @@ pub async fn install_ollama(on_progress: &Channel<InstallProgress>) -> Result<()
     }
 }
 
-/// Install Home Assistant Core in a managed venv using the bundled requirements file.
+/// Install Home Assistant Core in a managed venv.
+///
+/// On Windows HA cannot run natively — it requires WSL. This function installs
+/// HA inside the default WSL distribution's filesystem and is a no-op if WSL
+/// is unavailable. On macOS/Linux it uses a local Python venv as before.
 pub async fn install_home_assistant(
+    _app_data_dir: &PathBuf,
+    _resource_dir: &PathBuf,
+    on_progress: &Channel<InstallProgress>,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    return install_home_assistant_wsl(on_progress).await;
+
+    #[cfg(not(target_os = "windows"))]
+    install_home_assistant_native(_app_data_dir, _resource_dir, on_progress).await
+}
+
+/// Windows: install HA inside WSL. WSL auto-forwards port 8123 to the Windows host.
+#[cfg(target_os = "windows")]
+async fn install_home_assistant_wsl(on_progress: &Channel<InstallProgress>) -> Result<(), String> {
+    let _ = on_progress.send(InstallProgress::Started {
+        service: "Home Assistant".to_string(),
+    });
+
+    // Verify WSL is available
+    let wsl_ok = tokio::process::Command::new("wsl")
+        .args(["--", "echo", "ok"])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !wsl_ok {
+        let err = "WSL (Windows Subsystem for Linux) is required to run Home Assistant on Windows. \
+                   Install it by running: wsl --install".to_string();
+        let _ = on_progress.send(InstallProgress::Failed { error: err.clone() });
+        return Err(err);
+    }
+
+    let _ = on_progress.send(InstallProgress::Installing);
+
+    // Create the venv and install HA in a single bash invocation.
+    // Pin pycares to avoid aiodns/DNS resolver errors on some Linux kernels.
+    let install_script = "\
+        set -e && \
+        python3 -m venv ~/.sierra/ha-venv && \
+        ~/.sierra/ha-venv/bin/pip install --upgrade pip --quiet && \
+        ~/.sierra/ha-venv/bin/pip install 'pycares==4.11.0' homeassistant --quiet";
+
+    let _ = on_progress.send(InstallProgress::Downloading { percent: 20.0 });
+
+    let output = tokio::process::Command::new("wsl")
+        .args(["--", "bash", "-c", install_script])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run WSL install: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let _ = on_progress.send(InstallProgress::Failed { error: stderr.clone() });
+        return Err(format!("HA install in WSL failed: {}", stderr));
+    }
+
+    let _ = on_progress.send(InstallProgress::Configuring);
+
+    // Ensure config directory exists in WSL filesystem
+    let _ = tokio::process::Command::new("wsl")
+        .args(["--", "bash", "-c", "mkdir -p ~/.sierra/ha-config"])
+        .output()
+        .await;
+
+    let _ = on_progress.send(InstallProgress::Completed);
+    Ok(())
+}
+
+/// macOS / Linux: install HA in a local Python venv.
+#[cfg(not(target_os = "windows"))]
+async fn install_home_assistant_native(
     app_data_dir: &PathBuf,
     resource_dir: &PathBuf,
     on_progress: &Channel<InstallProgress>,
