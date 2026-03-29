@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use tauri::ipc::Channel;
 
+use crate::util::HideConsole;
+
 /// Returns the space-free path used for the managed HA virtual environment.
 ///
 /// uv (bundled with HA) has a bug in >=0.6.x where it splits `--constraint`
@@ -74,7 +76,7 @@ pub fn detect_dependencies(app_data_dir: &PathBuf) -> DependencyStatus {
 }
 
 fn detect_ollama() -> (bool, Option<String>) {
-    let result = Command::new("ollama").arg("--version").output();
+    let result = Command::new("ollama").arg("--version").hide_console().output();
 
     match result {
         Ok(output) if output.status.success() => {
@@ -166,6 +168,32 @@ fn detect_ha(_app_data_dir: &PathBuf) -> (bool, Option<String>) {
                                 String::from_utf8_lossy(&ver_output.stdout).trim().to_string();
                             return (true, if version.is_empty() { None } else { Some(version) });
                         }
+    let hass = venv.join("Scripts\\hass.exe");
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let hass = venv.join("bin/hass");
+
+    if hass.exists() {
+        let result = Command::new(&hass).arg("--version").hide_console().output();
+        return match result {
+            Ok(output) if output.status.success() => {
+                let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                (true, if version.is_empty() { None } else { Some(version) })
+            }
+            _ => (true, None), // Binary exists even if --version fails
+        };
+    }
+
+    // 2. Check system PATH
+    let check_cmd = if cfg!(target_os = "windows") { "where" } else { "which" };
+    if let Ok(output) = Command::new(check_cmd).arg("hass").hide_console().output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).lines().next().unwrap_or("").trim().to_string();
+            if !path.is_empty() {
+                // Found on PATH — try to get version
+                if let Ok(ver_output) = Command::new(&path).arg("--version").hide_console().output() {
+                    if ver_output.status.success() {
+                        let version = String::from_utf8_lossy(&ver_output.stdout).trim().to_string();
+                        return (true, if version.is_empty() { None } else { Some(version) });
                     }
                     return (true, None);
                 }
@@ -178,7 +206,7 @@ fn detect_ha(_app_data_dir: &PathBuf) -> (bool, Option<String>) {
 
 fn detect_python() -> (bool, Option<String>) {
     if let Some(cmd) = find_python_3_10_plus() {
-        if let Ok(output) = Command::new(&cmd).arg("--version").output() {
+        if let Ok(output) = Command::new(&cmd).arg("--version").hide_console().output() {
             if output.status.success() {
                 let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let version = if version.is_empty() {
@@ -195,7 +223,7 @@ fn detect_python() -> (bool, Option<String>) {
 
 fn detect_rust() -> (bool, Option<String>) {
     // Try rustc on PATH first
-    if let Ok(output) = Command::new("rustc").arg("--version").output() {
+    if let Ok(output) = Command::new("rustc").arg("--version").hide_console().output() {
         if output.status.success() {
             let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
             return (true, if version.is_empty() { None } else { Some(version) });
@@ -214,7 +242,7 @@ fn detect_rust() -> (bool, Option<String>) {
 
     if let Some(path) = rustc_path {
         if path.exists() {
-            if let Ok(output) = Command::new(&path).arg("--version").output() {
+            if let Ok(output) = Command::new(&path).arg("--version").hide_console().output() {
                 if output.status.success() {
                     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     return (true, if version.is_empty() { None } else { Some(version) });
@@ -336,7 +364,7 @@ fn find_python_3_10_plus() -> Option<String> {
         #[cfg(target_os = "windows")]
         if let Some((launcher, ver_flag)) = cmd.split_once(':') {
             let launcher_bin = if launcher == "py" { "py" } else { launcher };
-            if let Ok(output) = Command::new(launcher_bin).args([ver_flag, "--version"]).output() {
+            if let Ok(output) = Command::new(launcher_bin).args([ver_flag, "--version"]).hide_console().output() {
                 if output.status.success() {
                     let raw = {
                         let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -363,7 +391,7 @@ fn find_python_3_10_plus() -> Option<String> {
             continue;
         }
 
-        if let Ok(output) = Command::new(cmd).arg("--version").output() {
+        if let Ok(output) = Command::new(cmd).arg("--version").hide_console().output() {
             if !output.status.success() {
                 continue;
             }
@@ -460,6 +488,7 @@ pub async fn install_ollama(on_progress: &Channel<InstallProgress>) -> Result<()
         // Run silent install
         let output = tokio::process::Command::new(&installer_path)
             .args(["/SILENT", "/NORESTART"])
+            .hide_console()
             .output()
             .await
             .map_err(|e| format!("Failed to run installer: {}", e))?;
@@ -607,12 +636,14 @@ async fn install_home_assistant_native(
         let launcher_bin = if launcher == "py" { "py" } else { launcher };
         tokio::process::Command::new(launcher_bin)
             .args([ver_flag, "-m", "venv", venv_path.to_str().unwrap()])
+            .hide_console()
             .output()
             .await
             .map_err(|e| format!("Failed to create venv: {}", e))?
     } else {
         tokio::process::Command::new(&python)
             .args(["-m", "venv", venv_path.to_str().unwrap()])
+            .hide_console()
             .output()
             .await
             .map_err(|e| format!("Failed to create venv: {}", e))?
@@ -620,6 +651,7 @@ async fn install_home_assistant_native(
     #[cfg(not(target_os = "windows"))]
     let venv_output = tokio::process::Command::new(&python)
         .args(["-m", "venv", venv_path.to_str().unwrap()])
+        .hide_console()
         .output()
         .await
         .map_err(|e| format!("Failed to create venv: {}", e))?;
@@ -655,6 +687,7 @@ async fn install_home_assistant_native(
 
     let upgrade_output = tokio::process::Command::new(&python_in_venv)
         .args(["-m", "pip", "install", "--upgrade", "pip"])
+        .hide_console()
         .output()
         .await
         .map_err(|e| format!("Failed to upgrade pip: {}", e))?;
@@ -700,6 +733,7 @@ async fn install_home_assistant_native(
             "-r",
             requirements_path.to_str().unwrap(),
         ])
+        .hide_console()
         .output()
         .await
         .map_err(|e| format!("Failed to install requirements: {}", e))?;
@@ -717,6 +751,7 @@ async fn install_home_assistant_native(
 
     let output = tokio::process::Command::new(&pip)
         .args(["install", "homeassistant"])
+        .hide_console()
         .output()
         .await
         .map_err(|e| format!("Failed to install homeassistant: {}", e))?;
@@ -986,6 +1021,7 @@ pub async fn install_python(on_progress: &Channel<InstallProgress>) -> Result<()
                 "Include_test=0",
                 "Include_launcher=1",
             ])
+            .hide_console()
             .output()
             .await
             .map_err(|e| format!("Failed to run Python installer: {}", e))?;
@@ -1024,6 +1060,7 @@ fn find_brew() -> Option<String> {
     // Fallback: try PATH (works in dev/terminal context)
     if Command::new("brew")
         .arg("--version")
+        .hide_console()
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -1116,6 +1153,7 @@ pub async fn install_rust(on_progress: &Channel<InstallProgress>) -> Result<(), 
         // Run rustup-init non-interactively; installs the default toolchain.
         let output = tokio::process::Command::new(&rustup_path)
             .args(["-y", "--no-modify-path"])
+            .hide_console()
             .output()
             .await
             .map_err(|e| format!("Failed to run rustup-init: {}", e))?;

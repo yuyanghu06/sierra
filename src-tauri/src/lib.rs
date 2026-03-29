@@ -5,6 +5,7 @@ mod prompts;
 mod services;
 mod state;
 mod tools;
+mod util;
 
 use services::ha_client::HaRestClient;
 use services::mcp_server::{self, McpServerState};

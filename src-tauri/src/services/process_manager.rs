@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+use crate::util::HideConsole;
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", tag = "status")]
 pub enum ServiceStatus {
@@ -127,6 +129,7 @@ pub fn kill_process_on_port_8123() {
         // netstat -ano | findstr :8123, then taskkill /F /PID <pid>
         if let Ok(output) = Command::new("netstat")
             .args(["-ano"])
+            .hide_console()
             .output()
         {
             let text = String::from_utf8_lossy(&output.stdout);
@@ -137,6 +140,7 @@ pub fn kill_process_on_port_8123() {
                         println!("[HA] killing stale process on :8123 (pid: {})", pid);
                         let _ = Command::new("taskkill")
                             .args(["/F", "/PID", pid])
+                            .hide_console()
                             .output();
                     }
                 }
@@ -172,7 +176,7 @@ impl ProcessManager {
                 }
             }
             // Check PATH
-            if let Ok(output) = Command::new("which").arg("ollama").output() {
+            if let Ok(output) = Command::new("which").arg("ollama").hide_console().output() {
                 if output.status.success() {
                     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if !path.is_empty() {
@@ -193,7 +197,7 @@ impl ProcessManager {
         #[cfg(target_os = "windows")]
         {
             // Check PATH
-            if let Ok(output) = Command::new("where").arg("ollama").output() {
+            if let Ok(output) = Command::new("where").arg("ollama").hide_console().output() {
                 if output.status.success() {
                     let path = String::from_utf8_lossy(&output.stdout)
                         .lines()
@@ -249,7 +253,7 @@ impl ProcessManager {
         // 2. Check system PATH
         #[cfg(target_os = "macos")]
         {
-            if let Ok(output) = Command::new("which").arg("hass").output() {
+            if let Ok(output) = Command::new("which").arg("hass").hide_console().output() {
                 if output.status.success() {
                     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if !path.is_empty() {
@@ -261,7 +265,7 @@ impl ProcessManager {
 
         #[cfg(target_os = "windows")]
         {
-            if let Ok(output) = Command::new("where").arg("hass").output() {
+            if let Ok(output) = Command::new("where").arg("hass").hide_console().output() {
                 if output.status.success() {
                     let path = String::from_utf8_lossy(&output.stdout)
                         .lines()
