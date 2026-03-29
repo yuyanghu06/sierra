@@ -185,6 +185,8 @@ pub fn run() {
             commands::settings::get_active_model,
             commands::setup::check_dependencies,
             commands::setup::install_ollama,
+            commands::setup::install_python,
+            commands::setup::install_rust,
             commands::setup::install_home_assistant,
             commands::setup::pull_model,
             commands::setup::get_service_status,

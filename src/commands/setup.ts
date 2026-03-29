@@ -8,6 +8,8 @@ export interface DependencyStatus {
   haVersion: string | null;
   pythonAvailable: boolean;
   pythonVersion: string | null;
+  rustAvailable: boolean;
+  rustVersion: string | null;
 }
 
 export type InstallProgressEvent =
@@ -48,6 +50,22 @@ export async function installOllama(
   const channel = new Channel<InstallProgressEvent>();
   channel.onmessage = onProgress;
   return invoke("install_ollama", { onProgress: channel });
+}
+
+export async function installPython(
+  onProgress: (event: InstallProgressEvent) => void,
+): Promise<void> {
+  const channel = new Channel<InstallProgressEvent>();
+  channel.onmessage = onProgress;
+  return invoke("install_python", { onProgress: channel });
+}
+
+export async function installRust(
+  onProgress: (event: InstallProgressEvent) => void,
+): Promise<void> {
+  const channel = new Channel<InstallProgressEvent>();
+  channel.onmessage = onProgress;
+  return invoke("install_rust", { onProgress: channel });
 }
 
 export async function installHomeAssistant(

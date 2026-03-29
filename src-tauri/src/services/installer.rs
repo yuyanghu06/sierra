@@ -30,6 +30,8 @@ pub struct DependencyStatus {
     pub ha_version: Option<String>,
     pub python_available: bool,
     pub python_version: Option<String>,
+    pub rust_available: bool,
+    pub rust_version: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -57,6 +59,7 @@ pub fn detect_dependencies(app_data_dir: &PathBuf) -> DependencyStatus {
     let (ollama_installed, ollama_version) = detect_ollama();
     let (ha_installed, ha_version) = detect_ha(app_data_dir);
     let (python_available, python_version) = detect_python();
+    let (rust_available, rust_version) = detect_rust();
 
     DependencyStatus {
         ollama_installed,
@@ -65,6 +68,8 @@ pub fn detect_dependencies(app_data_dir: &PathBuf) -> DependencyStatus {
         ha_version,
         python_available,
         python_version,
+        rust_available,
+        rust_version,
     }
 }
 
@@ -167,6 +172,40 @@ fn detect_python() -> (bool, Option<String>) {
             }
         }
     }
+    (false, None)
+}
+
+fn detect_rust() -> (bool, Option<String>) {
+    // Try rustc on PATH first
+    if let Ok(output) = Command::new("rustc").arg("--version").output() {
+        if output.status.success() {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            return (true, if version.is_empty() { None } else { Some(version) });
+        }
+    }
+
+    // Check ~/.cargo/bin/rustc which rustup installs by default
+    #[cfg(target_os = "windows")]
+    let rustc_path = std::env::var("USERPROFILE")
+        .map(|home| PathBuf::from(home).join(".cargo").join("bin").join("rustc.exe"))
+        .ok();
+    #[cfg(not(target_os = "windows"))]
+    let rustc_path = std::env::var("HOME")
+        .map(|home| PathBuf::from(home).join(".cargo").join("bin").join("rustc"))
+        .ok();
+
+    if let Some(path) = rustc_path {
+        if path.exists() {
+            if let Ok(output) = Command::new(&path).arg("--version").output() {
+                if output.status.success() {
+                    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    return (true, if version.is_empty() { None } else { Some(version) });
+                }
+            }
+            return (true, None); // binary exists, version check failed
+        }
+    }
+
     (false, None)
 }
 
@@ -687,4 +726,324 @@ pub async fn pull_model(
 
     let _ = on_progress.send(PullProgress::Completed);
     Ok(())
+}
+
+// ── Python installation ──────────────────────────────────────────────────────
+
+/// Python 3.12 installer URLs (python.org official releases).
+/// Update this constant when a newer patch release is published.
+const PYTHON_VERSION: &str = "3.12.10";
+#[allow(dead_code)]
+const PYTHON_MACOS_PKG_URL: &str =
+    "https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg";
+#[allow(dead_code)]
+const PYTHON_WINDOWS_URL: &str =
+    "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe";
+
+/// Install Python 3.12 on macOS or Windows.
+///
+/// macOS: tries Homebrew first (user-space, no admin prompt), then falls back
+/// to the official python.org `.pkg` installer (requires admin via a system dialog).
+///
+/// Windows: downloads and runs the official python.org installer in quiet,
+/// per-user mode (no admin required, PATH is updated automatically).
+pub async fn install_python(on_progress: &Channel<InstallProgress>) -> Result<(), String> {
+    let _ = on_progress.send(InstallProgress::Started {
+        service: "Python".to_string(),
+    });
+
+    #[cfg(target_os = "macos")]
+    {
+        // ── Try Homebrew first ──────────────────────────────────────────────
+        let brew = find_brew();
+        if let Some(brew_bin) = brew {
+            let _ = on_progress.send(InstallProgress::Downloading { percent: 10.0 });
+            let output = tokio::process::Command::new(&brew_bin)
+                .args(["install", "python@3.12"])
+                .output()
+                .await
+                .map_err(|e| format!("Failed to run brew: {}", e))?;
+
+            if output.status.success() {
+                let _ = on_progress.send(InstallProgress::Completed);
+                return Ok(());
+            }
+            // brew failed — fall through to pkg installer
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("[installer] brew install python@3.12 failed: {}", stderr);
+        }
+
+        // ── Fall back: download python.org .pkg and run with admin privilege ─
+        let _ = on_progress.send(InstallProgress::Downloading { percent: 0.0 });
+
+        let client = reqwest::Client::new();
+        let temp_dir = std::env::temp_dir();
+        let pkg_filename = format!("python-{}-macos11.pkg", PYTHON_VERSION);
+        let pkg_path = temp_dir.join(&pkg_filename);
+
+        let response = client
+            .get(PYTHON_MACOS_PKG_URL)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to download Python: {}", e))?;
+
+        if !response.status().is_success() {
+            let msg = format!("Python download failed (HTTP {})", response.status());
+            let _ = on_progress.send(InstallProgress::Failed { error: msg.clone() });
+            return Err(msg);
+        }
+
+        let total = response.content_length().unwrap_or(0);
+        let mut downloaded: u64 = 0;
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        use futures_util::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
+            downloaded += chunk.len() as u64;
+            bytes.extend_from_slice(&chunk);
+            if total > 0 {
+                let percent = (downloaded as f32 / total as f32) * 90.0;
+                let _ = on_progress.send(InstallProgress::Downloading { percent });
+            }
+        }
+
+        std::fs::write(&pkg_path, &bytes)
+            .map_err(|e| format!("Failed to write Python pkg: {}", e))?;
+
+        let _ = on_progress.send(InstallProgress::Installing);
+
+        // Run the pkg installer with administrator privileges via osascript.
+        // This pops up a standard macOS authentication dialog.
+        let shell_cmd = format!(
+            "installer -pkg {} -target /",
+            pkg_path.to_string_lossy()
+        );
+        let osascript_arg = format!(
+            "do shell script \"{}\" with administrator privileges",
+            shell_cmd
+        );
+        let output = tokio::process::Command::new("osascript")
+            .args(["-e", &osascript_arg])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run osascript: {}", e))?;
+
+        // Clean up downloaded pkg regardless of outcome
+        let _ = std::fs::remove_file(&pkg_path);
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let _ = on_progress.send(InstallProgress::Failed { error: stderr.clone() });
+            return Err(format!("Python installation failed: {}", stderr));
+        }
+
+        let _ = on_progress.send(InstallProgress::Completed);
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = on_progress.send(InstallProgress::Downloading { percent: 0.0 });
+
+        let client = reqwest::Client::new();
+        let temp_dir = std::env::temp_dir();
+        let installer_filename = format!("python-{}-amd64.exe", PYTHON_VERSION);
+        let installer_path = temp_dir.join(&installer_filename);
+
+        let response = client
+            .get(PYTHON_WINDOWS_URL)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to download Python: {}", e))?;
+
+        if !response.status().is_success() {
+            let msg = format!("Python download failed (HTTP {})", response.status());
+            let _ = on_progress.send(InstallProgress::Failed { error: msg.clone() });
+            return Err(msg);
+        }
+
+        let total = response.content_length().unwrap_or(0);
+        let mut downloaded: u64 = 0;
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        use futures_util::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
+            downloaded += chunk.len() as u64;
+            bytes.extend_from_slice(&chunk);
+            if total > 0 {
+                let percent = (downloaded as f32 / total as f32) * 90.0;
+                let _ = on_progress.send(InstallProgress::Downloading { percent });
+            }
+        }
+
+        std::fs::write(&installer_path, &bytes)
+            .map_err(|e| format!("Failed to write Python installer: {}", e))?;
+
+        let _ = on_progress.send(InstallProgress::Installing);
+
+        // Per-user install (no admin required), prepend to PATH so it's usable immediately.
+        let output = tokio::process::Command::new(&installer_path)
+            .args([
+                "/quiet",
+                "InstallAllUsers=0",
+                "PrependPath=1",
+                "Include_test=0",
+                "Include_launcher=1",
+            ])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run Python installer: {}", e))?;
+
+        // Clean up installer
+        let _ = std::fs::remove_file(&installer_path);
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let _ = on_progress.send(InstallProgress::Failed { error: stderr.clone() });
+            return Err(format!("Python installation failed: {}", stderr));
+        }
+
+        let _ = on_progress.send(InstallProgress::Completed);
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = on_progress.send(InstallProgress::Failed {
+            error: "Platform not supported".to_string(),
+        });
+        Err("Platform not supported for automatic Python installation".to_string())
+    }
+}
+
+/// Find the Homebrew binary on macOS. Returns the absolute path or "brew" if it is on PATH.
+#[cfg(target_os = "macos")]
+fn find_brew() -> Option<String> {
+    // Common install locations (Homebrew on Apple Silicon vs Intel)
+    for path in &["/opt/homebrew/bin/brew", "/usr/local/bin/brew"] {
+        if PathBuf::from(path).exists() {
+            return Some(path.to_string());
+        }
+    }
+    // Fallback: try PATH (works in dev/terminal context)
+    if Command::new("brew")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Some("brew".to_string());
+    }
+    None
+}
+
+// ── Rust / rustup installation ───────────────────────────────────────────────
+
+/// Install the Rust toolchain via rustup.
+///
+/// macOS: pipes the official rustup init script through `sh` (the same method
+/// documented at <https://rustup.rs>).
+///
+/// Windows: downloads `rustup-init.exe` from static.rust-lang.org and runs it
+/// in non-interactive mode.
+pub async fn install_rust(on_progress: &Channel<InstallProgress>) -> Result<(), String> {
+    let _ = on_progress.send(InstallProgress::Started {
+        service: "Rust".to_string(),
+    });
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = on_progress.send(InstallProgress::Downloading { percent: 0.0 });
+
+        // Pipe the rustup installer script through sh with -y (non-interactive).
+        let output = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y")
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run rustup installer: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let _ = on_progress.send(InstallProgress::Failed { error: stderr.clone() });
+            return Err(format!("Rust installation failed: {}", stderr));
+        }
+
+        let _ = on_progress.send(InstallProgress::Completed);
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = on_progress.send(InstallProgress::Downloading { percent: 0.0 });
+
+        let client = reqwest::Client::new();
+        let temp_dir = std::env::temp_dir();
+        let rustup_path = temp_dir.join("rustup-init.exe");
+
+        let response = client
+            .get("https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe")
+            .send()
+            .await
+            .map_err(|e| format!("Failed to download rustup-init: {}", e))?;
+
+        if !response.status().is_success() {
+            let msg = format!("rustup-init download failed (HTTP {})", response.status());
+            let _ = on_progress.send(InstallProgress::Failed { error: msg.clone() });
+            return Err(msg);
+        }
+
+        let total = response.content_length().unwrap_or(0);
+        let mut downloaded: u64 = 0;
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        use futures_util::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
+            downloaded += chunk.len() as u64;
+            bytes.extend_from_slice(&chunk);
+            if total > 0 {
+                let percent = (downloaded as f32 / total as f32) * 80.0;
+                let _ = on_progress.send(InstallProgress::Downloading { percent });
+            }
+        }
+
+        std::fs::write(&rustup_path, &bytes)
+            .map_err(|e| format!("Failed to write rustup-init: {}", e))?;
+
+        // Mark the downloaded binary as executable (on Windows this is a no-op;
+        // the file is already executable by virtue of being a .exe)
+        let _ = &rustup_path; // suppress unused-variable warning if cfg changes
+
+        let _ = on_progress.send(InstallProgress::Installing);
+
+        // Run rustup-init non-interactively; installs the default toolchain.
+        let output = tokio::process::Command::new(&rustup_path)
+            .args(["-y", "--no-modify-path"])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run rustup-init: {}", e))?;
+
+        // Clean up
+        let _ = std::fs::remove_file(&rustup_path);
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let _ = on_progress.send(InstallProgress::Failed { error: stderr.clone() });
+            return Err(format!("Rust installation failed: {}", stderr));
+        }
+
+        let _ = on_progress.send(InstallProgress::Completed);
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = on_progress.send(InstallProgress::Failed {
+            error: "Platform not supported".to_string(),
+        });
+        Err("Platform not supported for automatic Rust installation".to_string())
+    }
 }

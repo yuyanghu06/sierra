@@ -21,8 +21,9 @@ pub async fn check_dependencies(app_handle: tauri::AppHandle) -> Result<Dependen
 
     let status = installer::detect_dependencies(&app_data_dir);
     println!(
-        "[setup] check_dependencies: ollama={} ha={} python={}",
-        status.ollama_installed, status.home_assistant_installed, status.python_available
+        "[setup] check_dependencies: ollama={} ha={} python={} rust={}",
+        status.ollama_installed, status.home_assistant_installed,
+        status.python_available, status.rust_available
     );
     Ok(status)
 }
@@ -30,6 +31,16 @@ pub async fn check_dependencies(app_handle: tauri::AppHandle) -> Result<Dependen
 #[tauri::command]
 pub async fn install_ollama(on_progress: Channel<InstallProgress>) -> Result<(), String> {
     installer::install_ollama(&on_progress).await
+}
+
+#[tauri::command]
+pub async fn install_python(on_progress: Channel<InstallProgress>) -> Result<(), String> {
+    installer::install_python(&on_progress).await
+}
+
+#[tauri::command]
+pub async fn install_rust(on_progress: Channel<InstallProgress>) -> Result<(), String> {
+    installer::install_rust(&on_progress).await
 }
 
 #[tauri::command]

@@ -2,6 +2,8 @@ import { useState, useEffect, useRef } from "react";
 import {
   checkDependencies,
   installOllama,
+  installPython,
+  installRust,
   installHomeAssistant,
   pullModel,
   startServices,
@@ -25,6 +27,12 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
   const [deps, setDeps] = useState<DependencyStatus | null>(null);
 
   // Install step
+  const [pythonInstalling, setPythonInstalling] = useState(false);
+  const [pythonProgress, setPythonProgress] = useState("");
+  const [pythonError, setPythonError] = useState<string | null>(null);
+  const [rustInstalling, setRustInstalling] = useState(false);
+  const [rustProgress, setRustProgress] = useState("");
+  const [rustError, setRustError] = useState<string | null>(null);
   const [ollamaInstalling, setOllamaInstalling] = useState(false);
   const [ollamaProgress, setOllamaProgress] = useState("");
   const [ollamaError, setOllamaError] = useState<string | null>(null);
@@ -77,7 +85,8 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
     try {
       const status = await checkDependencies();
       setDeps(status);
-      if (status.ollamaInstalled && status.homeAssistantInstalled) {
+      if (status.ollamaInstalled && status.homeAssistantInstalled &&
+          status.pythonAvailable && status.rustAvailable) {
         setStep("ha-onboarding");
       } else {
         setStep("install");
@@ -158,6 +167,44 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
       setModelError(String(e));
       setModelProgress("");
     }
+  }
+
+  async function handleInstallPython() {
+    setPythonInstalling(true);
+    setPythonProgress("Starting...");
+    setPythonError(null);
+    try {
+      await installPython((event: InstallProgressEvent) => {
+        if (event.event === "started") setPythonProgress("Starting installation...");
+        else if (event.event === "downloading") setPythonProgress(`Downloading… ${Math.round(event.data.percent)}%`);
+        else if (event.event === "installing") setPythonProgress("Installing...");
+        else if (event.event === "completed") { setPythonProgress("Installed"); setDeps((d) => d ? { ...d, pythonAvailable: true } : d); }
+        else if (event.event === "failed") { setPythonError(event.data.error); setPythonProgress(""); }
+      });
+    } catch (e) {
+      setPythonError(String(e));
+      setPythonProgress("");
+    }
+    setPythonInstalling(false);
+  }
+
+  async function handleInstallRust() {
+    setRustInstalling(true);
+    setRustProgress("Starting...");
+    setRustError(null);
+    try {
+      await installRust((event: InstallProgressEvent) => {
+        if (event.event === "started") setRustProgress("Starting installation...");
+        else if (event.event === "downloading") setRustProgress(`Downloading… ${Math.round(event.data.percent)}%`);
+        else if (event.event === "installing") setRustProgress("Installing...");
+        else if (event.event === "completed") { setRustProgress("Installed"); setDeps((d) => d ? { ...d, rustAvailable: true } : d); }
+        else if (event.event === "failed") { setRustError(event.data.error); setRustProgress(""); }
+      });
+    } catch (e) {
+      setRustError(String(e));
+      setRustProgress("");
+    }
+    setRustInstalling(false);
   }
 
   async function handleInstallOllama() {
@@ -252,7 +299,8 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
     onComplete();
   }
 
-  const bothInstalled = deps?.ollamaInstalled && deps?.homeAssistantInstalled;
+  const bothInstalled = deps?.ollamaInstalled && deps?.homeAssistantInstalled &&
+    deps?.pythonAvailable && deps?.rustAvailable;
   const tokenConnected = tokenStatus?.status === "connected";
 
   return (
@@ -277,6 +325,24 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
         {/* Install dependencies */}
         {step === "install" && (
           <div className="setup-body">
+            <SetupDep
+              name="Python 3.12"
+              desc="Required for Home Assistant"
+              installed={!!deps?.pythonAvailable}
+              installing={pythonInstalling}
+              progress={pythonProgress}
+              error={pythonError}
+              onInstall={handleInstallPython}
+            />
+            <SetupDep
+              name="Rust"
+              desc="Required to build native components"
+              installed={!!deps?.rustAvailable}
+              installing={rustInstalling}
+              progress={rustProgress}
+              error={rustError}
+              onInstall={handleInstallRust}
+            />
             <SetupDep
               name="Ollama"
               desc="Local LLM inference"
