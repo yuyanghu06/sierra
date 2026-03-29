@@ -3,6 +3,24 @@ use std::path::PathBuf;
 use std::process::Command;
 use tauri::ipc::Channel;
 
+/// Returns the space-free path used for the managed HA virtual environment.
+///
+/// uv (bundled with HA) has a bug in >=0.6.x where it splits `--constraint`
+/// paths on spaces, causing startup failures when the app data directory
+/// contains "Application Support". Using a home-relative path avoids this.
+pub fn ha_venv_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(base).join(".sierra").join("ha-venv")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home).join(".sierra").join("ha-venv")
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DependencyStatus {
@@ -92,8 +110,9 @@ fn detect_ollama() -> (bool, Option<String>) {
     }
 }
 
-fn detect_ha(app_data_dir: &PathBuf) -> (bool, Option<String>) {
-    let venv = app_data_dir.join("ha-venv");
+fn detect_ha(_app_data_dir: &PathBuf) -> (bool, Option<String>) {
+    // 1. Check managed venv (space-free path — see ha_venv_dir() for rationale)
+    let venv = ha_venv_dir();
 
     #[cfg(target_os = "macos")]
     let hass = venv.join("bin/hass");
@@ -102,30 +121,41 @@ fn detect_ha(app_data_dir: &PathBuf) -> (bool, Option<String>) {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let hass = venv.join("bin/hass");
 
-    if !hass.exists() {
-        return (false, None);
+    if hass.exists() {
+        let result = Command::new(&hass).arg("--version").output();
+        return match result {
+            Ok(output) if output.status.success() => {
+                let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                (true, if version.is_empty() { None } else { Some(version) })
+            }
+            _ => (true, None), // Binary exists even if --version fails
+        };
     }
 
-    let result = Command::new(&hass).arg("--version").output();
-    match result {
-        Ok(output) if output.status.success() => {
-            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            (true, if version.is_empty() { None } else { Some(version) })
+    // 2. Check system PATH
+    let check_cmd = if cfg!(target_os = "windows") { "where" } else { "which" };
+    if let Ok(output) = Command::new(check_cmd).arg("hass").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).lines().next().unwrap_or("").trim().to_string();
+            if !path.is_empty() {
+                // Found on PATH — try to get version
+                if let Ok(ver_output) = Command::new(&path).arg("--version").output() {
+                    if ver_output.status.success() {
+                        let version = String::from_utf8_lossy(&ver_output.stdout).trim().to_string();
+                        return (true, if version.is_empty() { None } else { Some(version) });
+                    }
+                }
+                return (true, None);
+            }
         }
-        _ => (true, None), // Binary exists even if --version fails
     }
+
+    (false, None)
 }
 
 fn detect_python() -> (bool, Option<String>) {
-    // Try python3 first (macOS), then python (Windows)
-    let commands = if cfg!(target_os = "windows") {
-        vec!["python", "python3"]
-    } else {
-        vec!["python3", "python"]
-    };
-
-    for cmd in commands {
-        if let Ok(output) = Command::new(cmd).arg("--version").output() {
+    if let Some(cmd) = find_python_3_10_plus() {
+        if let Ok(output) = Command::new(&cmd).arg("--version").output() {
             if output.status.success() {
                 let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let version = if version.is_empty() {
@@ -140,13 +170,167 @@ fn detect_python() -> (bool, Option<String>) {
     (false, None)
 }
 
-/// Get the python command name for this platform
-fn python_cmd() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "python"
+/// Find the best available Python >= 3.10 on the system.
+/// Prefers specific versioned commands (3.13 → 3.10) before falling back to
+/// the generic `python3` / `python` names, which on macOS may point to Apple's
+/// bundled Python 3.9 or earlier.
+///
+/// Also checks well-known absolute paths because Tauri spawns subprocesses with
+/// a restricted PATH (/usr/bin:/bin only) that omits Homebrew, pyenv, and the
+/// official python.org installer locations.
+fn find_python_3_10_plus() -> Option<String> {
+    // Short names tried via PATH (works in dev / terminal context).
+    // On Windows also try the `py` launcher which is installed by the python.org
+    // installer and supports versioned invocation.
+    let name_candidates: Vec<&str> = if cfg!(target_os = "windows") {
+        vec![
+            "python3.13", "python3.12", "python3.11", "python3.10",
+            "python", "python3",
+        ]
     } else {
-        "python3"
+        vec![
+            "python3.13", "python3.12", "python3.11", "python3.10",
+            "python3", "python",
+        ]
+    };
+
+    // Absolute paths to check — covers macOS python.org, Homebrew (Intel + ARM),
+    // pyenv default, and Windows py launcher / common install dirs.
+    #[cfg(target_os = "macos")]
+    let abs_candidates: Vec<String> = {
+        let mut paths = Vec::new();
+        for minor in (10u32..=15).rev() {
+            let ver = format!("3.{}", minor);
+            // python.org framework installer
+            paths.push(format!(
+                "/Library/Frameworks/Python.framework/Versions/{}/bin/python{}",
+                ver, ver
+            ));
+            // Homebrew Apple Silicon
+            paths.push(format!("/opt/homebrew/bin/python{}", ver));
+            // Homebrew Intel / /usr/local
+            paths.push(format!("/usr/local/bin/python{}", ver));
+        }
+        // pyenv shims
+        if let Ok(home) = std::env::var("HOME") {
+            for minor in (10u32..=15).rev() {
+                paths.push(format!("{}/.pyenv/shims/python3.{}", home, minor));
+            }
+        }
+        paths
+    };
+
+    #[cfg(target_os = "windows")]
+    let abs_candidates: Vec<String> = {
+        let mut paths = Vec::new();
+
+        // Windows `py` launcher — installed by python.org and supports versioned flags.
+        // We check if `py -3.X --version` works by probing via the launcher name.
+        // (Actual invocation happens below using the launcher path after detection.)
+        let py_launcher = r"C:\Windows\py.exe";
+        for minor in (10u32..=15).rev() {
+            // Launcher-style: "py -3.13" — encode as a wrapper path we can probe
+            // We handle this specially in the probe loop below.
+            paths.push(format!("py:-3.{}", minor));
+        }
+
+        // python.org default install: C:\Users\<user>\AppData\Local\Programs\Python\Python3XX
+        // Use LOCALAPPDATA env var — handles non-C: drives and domain accounts.
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            for minor in (10u32..=15).rev() {
+                paths.push(format!(
+                    "{}\\Programs\\Python\\Python3{}\\python.exe",
+                    local, minor
+                ));
+            }
+        }
+
+        // Classic per-machine install: C:\Python3XX (still common)
+        let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+        for minor in (10u32..=15).rev() {
+            paths.push(format!("{}\\Python3{}\\python.exe", sys_drive, minor));
+        }
+
+        // py launcher absolute path fallback (if not on PATH)
+        if std::path::Path::new(py_launcher).exists() {
+            for minor in (10u32..=15).rev() {
+                paths.push(format!("{}:-3.{}", py_launcher, minor));
+            }
+        }
+
+        paths
+    };
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let abs_candidates: Vec<String> = (10u32..=15)
+        .rev()
+        .map(|minor| format!("/usr/bin/python3.{}", minor))
+        .collect();
+
+    // Chain name candidates first (respects user PATH in dev), then absolute paths
+    let all_candidates: Vec<String> = name_candidates
+        .iter()
+        .map(|s| s.to_string())
+        .chain(abs_candidates)
+        .collect();
+
+    for cmd in &all_candidates {
+        // Handle Windows `py` launcher entries encoded as "path:-3.X" or "py:-3.X"
+        #[cfg(target_os = "windows")]
+        if let Some((launcher, ver_flag)) = cmd.split_once(':') {
+            let launcher_bin = if launcher == "py" { "py" } else { launcher };
+            if let Ok(output) = Command::new(launcher_bin).args([ver_flag, "--version"]).output() {
+                if output.status.success() {
+                    let raw = {
+                        let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        if out.is_empty() {
+                            String::from_utf8_lossy(&output.stderr).trim().to_string()
+                        } else {
+                            out
+                        }
+                    };
+                    if let Some(ver) = raw.strip_prefix("Python ") {
+                        let parts: Vec<u64> = ver
+                            .split('.')
+                            .filter_map(|s| s.parse().ok())
+                            .collect();
+                        if parts.len() >= 2 && (parts[0] > 3 || (parts[0] == 3 && parts[1] >= 10)) {
+                            // Return the launcher invocation as a usable command string.
+                            // Caller (venv creation) will split on ':' to get args.
+                            println!("[installer] found Python >= 3.10 via py launcher: {} {}", launcher_bin, ver_flag);
+                            return Some(cmd.clone());
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if let Ok(output) = Command::new(cmd).arg("--version").output() {
+            if !output.status.success() {
+                continue;
+            }
+            let raw = {
+                let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if out.is_empty() {
+                    String::from_utf8_lossy(&output.stderr).trim().to_string()
+                } else {
+                    out
+                }
+            };
+            if let Some(ver) = raw.strip_prefix("Python ") {
+                let parts: Vec<u64> = ver
+                    .split('.')
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+                if parts.len() >= 2 && (parts[0] > 3 || (parts[0] == 3 && parts[1] >= 10)) {
+                    println!("[installer] found Python >= 3.10 at: {}", cmd);
+                    return Some(cmd.clone());
+                }
+            }
+        }
     }
+    None
 }
 
 /// Install Ollama
@@ -247,39 +431,67 @@ pub async fn install_ollama(on_progress: &Channel<InstallProgress>) -> Result<()
     }
 }
 
-/// Install Home Assistant Core in a managed venv
+/// Install Home Assistant Core in a managed venv using the bundled requirements file.
 pub async fn install_home_assistant(
     app_data_dir: &PathBuf,
+    resource_dir: &PathBuf,
     on_progress: &Channel<InstallProgress>,
 ) -> Result<(), String> {
     let _ = on_progress.send(InstallProgress::Started {
         service: "Home Assistant".to_string(),
     });
 
-    // Check Python is available
-    let python = python_cmd();
-    let python_check = tokio::process::Command::new(python)
-        .arg("--version")
-        .output()
-        .await;
+    // Find a Python >= 3.10 — required by Home Assistant and its dependencies.
+    // Prefer versioned commands (python3.13, python3.12, ...) over the generic
+    // `python3` which on macOS may be Apple's ancient bundled Python < 3.10.
+    let python = match find_python_3_10_plus() {
+        Some(cmd) => cmd,
+        None => {
+            let _ = on_progress.send(InstallProgress::Failed {
+                error: "Python 3.10 or newer is required but not found. Please install Python 3.12+ from python.org.".to_string(),
+            });
+            return Err("Python 3.10+ not found".to_string());
+        }
+    };
+    println!("[installer] using Python: {}", python);
 
-    if python_check.is_err() || !python_check.unwrap().status.success() {
-        let _ = on_progress.send(InstallProgress::Failed {
-            error: "Python 3 is required but not found. Please install Python 3.12+.".to_string(),
-        });
-        return Err("Python 3 not found".to_string());
+    let venv_path = ha_venv_dir();
+
+    // Step 1: Remove any stale venv, then create a fresh one with Python >= 3.10.
+    // A venv created with an older Python (< 3.10) will silently fail to install
+    // many of HA's dependencies, so we always start clean.
+    if venv_path.exists() {
+        println!("[installer] removing stale venv at {}", venv_path.display());
+        if let Err(e) = std::fs::remove_dir_all(&venv_path) {
+            eprintln!("[installer] warning: could not remove stale venv: {}", e);
+        }
     }
-
-    let venv_path = app_data_dir.join("ha-venv");
-
-    // Step 1: Create virtual environment
     let _ = on_progress.send(InstallProgress::Installing);
 
-    let output = tokio::process::Command::new(python)
+    // Build the venv creation command — handle Windows `py:-3.X` launcher entries.
+    #[cfg(target_os = "windows")]
+    let venv_output = if let Some((launcher, ver_flag)) = python.split_once(':') {
+        let launcher_bin = if launcher == "py" { "py" } else { launcher };
+        tokio::process::Command::new(launcher_bin)
+            .args([ver_flag, "-m", "venv", venv_path.to_str().unwrap()])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to create venv: {}", e))?
+    } else {
+        tokio::process::Command::new(&python)
+            .args(["-m", "venv", venv_path.to_str().unwrap()])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to create venv: {}", e))?
+    };
+    #[cfg(not(target_os = "windows"))]
+    let venv_output = tokio::process::Command::new(&python)
         .args(["-m", "venv", venv_path.to_str().unwrap()])
         .output()
         .await
         .map_err(|e| format!("Failed to create venv: {}", e))?;
+
+    let output = venv_output;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -289,15 +501,86 @@ pub async fn install_home_assistant(
         return Err(format!("Failed to create venv: {}", stderr));
     }
 
-    // Step 2: Install homeassistant
-    let _ = on_progress.send(InstallProgress::Downloading { percent: 50.0 });
+    #[cfg(target_os = "macos")]
+    let pip = venv_path.join("bin").join("pip");
+    #[cfg(target_os = "windows")]
+    let pip = venv_path.join("Scripts").join("pip.exe");
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let pip = venv_path.join("bin").join("pip");
+
+    // Step 2: Upgrade pip inside the venv before installing packages.
+    // The pip bundled with freshly-created venvs can be very old (e.g. 21.x)
+    // and fails to resolve packages that require newer metadata handling.
+    let _ = on_progress.send(InstallProgress::Downloading { percent: 10.0 });
 
     #[cfg(target_os = "macos")]
-    let pip = venv_path.join("bin/pip");
+    let python_in_venv = venv_path.join("bin").join("python3");
     #[cfg(target_os = "windows")]
-    let pip = venv_path.join("Scripts\\pip.exe");
+    let python_in_venv = venv_path.join("Scripts").join("python.exe");
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let pip = venv_path.join("bin/pip");
+    let python_in_venv = venv_path.join("bin").join("python3");
+
+    let upgrade_output = tokio::process::Command::new(&python_in_venv)
+        .args(["-m", "pip", "install", "--upgrade", "pip"])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to upgrade pip: {}", e))?;
+
+    if !upgrade_output.status.success() {
+        // Non-fatal — log and continue with whatever pip version we have
+        let stderr = String::from_utf8_lossy(&upgrade_output.stderr);
+        eprintln!("[installer] pip upgrade warning: {}", stderr);
+    } else {
+        println!("[installer] pip upgraded successfully");
+    }
+
+    // Step 3: Install pinned dependencies from bundled requirements.txt
+    let _ = on_progress.send(InstallProgress::Downloading { percent: 25.0 });
+
+    // In production builds, resources are in resource_dir.
+    // In dev mode, fall back to src-tauri/resources/.
+    let requirements_path = {
+        let bundled = resource_dir.join("requirements.txt");
+        if bundled.exists() {
+            bundled
+        } else {
+            let dev_fallback = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/requirements.txt");
+            if dev_fallback.exists() {
+                dev_fallback
+            } else {
+                let _ = on_progress.send(InstallProgress::Failed {
+                    error: "Bundled requirements.txt not found".to_string(),
+                });
+                return Err(format!(
+                    "requirements.txt not found at {} or {}",
+                    bundled.display(),
+                    dev_fallback.display()
+                ));
+            }
+        }
+    };
+    println!("[installer] Using requirements.txt from {}", requirements_path.display());
+
+    let output = tokio::process::Command::new(&pip)
+        .args([
+            "install",
+            "-r",
+            requirements_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to install requirements: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let _ = on_progress.send(InstallProgress::Failed {
+            error: stderr.clone(),
+        });
+        return Err(format!("Failed to install requirements: {}", stderr));
+    }
+
+    // Step 4: Install homeassistant into the same venv
+    let _ = on_progress.send(InstallProgress::Downloading { percent: 75.0 });
 
     let output = tokio::process::Command::new(&pip)
         .args(["install", "homeassistant"])
@@ -313,22 +596,8 @@ pub async fn install_home_assistant(
         return Err(format!("Failed to install homeassistant: {}", stderr));
     }
 
-    // Step 3: Pin pycares to avoid DNS resolver errors
+    // Step 5: Configure
     let _ = on_progress.send(InstallProgress::Configuring);
-
-    let output = tokio::process::Command::new(&pip)
-        .args(["install", "pycares==4.11.0"])
-        .output()
-        .await
-        .map_err(|e| format!("Failed to pin pycares: {}", e))?;
-
-    if !output.status.success() {
-        // Non-fatal — log but continue
-        eprintln!(
-            "Warning: Failed to pin pycares: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
 
     // Create HA config directory
     let ha_config = app_data_dir.join("ha-config");

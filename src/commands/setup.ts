@@ -1,12 +1,13 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
+export { testHaConnection, type HaConnectionStatus } from "./config";
 
 export interface DependencyStatus {
-  ollama_installed: boolean;
-  ollama_version: string | null;
-  home_assistant_installed: boolean;
-  ha_version: string | null;
-  python_available: boolean;
-  python_version: string | null;
+  ollamaInstalled: boolean;
+  ollamaVersion: string | null;
+  homeAssistantInstalled: boolean;
+  haVersion: string | null;
+  pythonAvailable: boolean;
+  pythonVersion: string | null;
 }
 
 export type InstallProgressEvent =
@@ -25,7 +26,7 @@ export type PullProgressEvent =
 
 export interface ServiceStatusInfo {
   ollama: ServiceStatus;
-  home_assistant: ServiceStatus;
+  homeAssistant: ServiceStatus;
 }
 
 export type ServiceStatus =

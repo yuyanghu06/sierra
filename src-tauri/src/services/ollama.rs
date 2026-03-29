@@ -64,19 +64,31 @@ struct OllamaModelEntry {
 impl OllamaService {
     pub fn new(base_url: String, model: String) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             base_url,
             model,
         }
     }
 
+    /// Parse a single NDJSON line from the Ollama stream.
+    fn parse_chunk(line: &str) -> Result<OllamaChatResponse, String> {
+        serde_json::from_str(line).map_err(|e| format!("JSON parse error: {}", e))
+    }
+
     /// Stream a response from Ollama, parsing NDJSON line by line.
-    /// Returns the collected full response once done.
-    async fn stream_response(
+    /// Sends text tokens via `on_token`. Returns the final response (which
+    /// may contain tool_calls on its `done` chunk).
+    async fn consume_stream<F>(
         &self,
         response: reqwest::Response,
-        tx: &mpsc::Sender<StreamChunk>,
-    ) -> Result<OllamaChatResponse, String> {
+        mut on_token: F,
+    ) -> Result<OllamaChatResponse, String>
+    where
+        F: FnMut(&str, bool),
+    {
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
         let mut last_response: Option<OllamaChatResponse> = None;
@@ -95,23 +107,13 @@ impl OllamaService {
                     continue;
                 }
 
-                let parsed: OllamaChatResponse =
-                    serde_json::from_str(line).map_err(|e| format!("JSON parse error: {}", e))?;
+                let parsed = Self::parse_chunk(line)?;
 
                 if !parsed.message.content.is_empty() {
-                    let _ = tx
-                        .send(StreamChunk {
-                            content: parsed.message.content.clone(),
-                            done: parsed.done,
-                        })
-                        .await;
+                    on_token(&parsed.message.content, parsed.done);
                 }
 
-                if parsed.done {
-                    last_response = Some(parsed);
-                } else {
-                    last_response = Some(parsed);
-                }
+                last_response = Some(parsed);
             }
         }
 
@@ -120,12 +122,7 @@ impl OllamaService {
         if !remaining.is_empty() {
             if let Ok(parsed) = serde_json::from_str::<OllamaChatResponse>(remaining) {
                 if !parsed.message.content.is_empty() {
-                    let _ = tx
-                        .send(StreamChunk {
-                            content: parsed.message.content.clone(),
-                            done: parsed.done,
-                        })
-                        .await;
+                    on_token(&parsed.message.content, parsed.done);
                 }
                 last_response = Some(parsed);
             }
@@ -158,18 +155,33 @@ impl OllamaService {
         stream: bool,
         tools: Option<&[serde_json::Value]>,
     ) -> Result<reqwest::Response, String> {
+        let tool_count = tools.map(|t| t.len()).unwrap_or(0);
+        println!(
+            "[ollama] POST /api/chat model={} messages={} stream={} tools={}",
+            self.model,
+            messages.len(),
+            stream,
+            tool_count,
+        );
+
+        let start = std::time::Instant::now();
         let response = self
             .send_request(messages, stream, tools)
             .send()
             .await
-            .map_err(|e| format!("Failed to connect to Ollama: {}", e))?;
+            .map_err(|e| {
+                println!("[ollama] POST /api/chat FAILED after {:?}: {}", start.elapsed(), e);
+                format!("Failed to connect to Ollama: {}", e)
+            })?;
 
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+        if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
+            println!("[ollama] POST /api/chat returned {} after {:?}: {}", status, start.elapsed(), body);
             return Err(format!("Ollama returned {}: {}", status, body));
         }
 
+        println!("[ollama] POST /api/chat connected {} after {:?}", status, start.elapsed());
         Ok(response)
     }
 }
@@ -181,8 +193,17 @@ impl LlmService for OllamaService {
         messages: Vec<ChatMessage>,
         tx: mpsc::Sender<StreamChunk>,
     ) -> Result<(), String> {
+        println!("[ollama] chat_stream starting");
+        let start = std::time::Instant::now();
         let response = self.post_chat(&messages, true, None).await?;
-        self.stream_response(response, &tx).await?;
+        self.consume_stream(response, |content, done| {
+            let _ = tx.try_send(StreamChunk {
+                content: content.to_string(),
+                done,
+            });
+        })
+        .await?;
+        println!("[ollama] chat_stream completed in {:?}", start.elapsed());
         Ok(())
     }
 
@@ -195,19 +216,33 @@ impl LlmService for OllamaService {
     ) -> Result<Vec<ChatMessage>, String> {
         let mut conversation = messages;
         let max_tool_rounds = 10;
+        let overall_start = std::time::Instant::now();
+        println!("[ollama] chat_with_tools starting ({} tools registered)", tools.len());
 
-        for _ in 0..max_tool_rounds {
-            // Non-streaming request when tools are available, so we can inspect tool_calls
+        for round in 0..max_tool_rounds {
+            println!("[ollama] chat_with_tools round {} — {} messages in conversation", round + 1, conversation.len());
+            let round_start = std::time::Instant::now();
+
             let response = self
-                .post_chat(&conversation, false, Some(&tools))
+                .post_chat(&conversation, true, Some(&tools))
                 .await?;
 
-            let body: OllamaChatResponse = response
-                .json()
-                .await
-                .map_err(|e| format!("Failed to parse Ollama response: {}", e))?;
+            let tx_ref = &tx;
+            let mut streamed_content = String::new();
 
-            let has_tool_calls = body
+            let final_resp = self
+                .consume_stream(response, |content, done| {
+                    streamed_content.push_str(content);
+                    let _ = tx_ref.try_send(LlmEvent::Token(StreamChunk {
+                        content: content.to_string(),
+                        done,
+                    }));
+                })
+                .await?;
+
+            println!("[ollama] chat_with_tools round {} stream completed in {:?} ({} chars)", round + 1, round_start.elapsed(), streamed_content.len());
+
+            let has_tool_calls = final_resp
                 .message
                 .tool_calls
                 .as_ref()
@@ -215,19 +250,10 @@ impl LlmService for OllamaService {
                 .unwrap_or(false);
 
             if !has_tool_calls {
-                // Final text response — send the content as tokens
-                if !body.message.content.is_empty() {
-                    let _ = tx
-                        .send(LlmEvent::Token(StreamChunk {
-                            content: body.message.content.clone(),
-                            done: true,
-                        }))
-                        .await;
-                }
-
+                println!("[ollama] chat_with_tools finished (text response) in {:?}", overall_start.elapsed());
                 conversation.push(ChatMessage {
                     role: "assistant".to_string(),
-                    content: body.message.content,
+                    content: streamed_content,
                     tool_calls: None,
                 });
 
@@ -235,9 +261,14 @@ impl LlmService for OllamaService {
             }
 
             // Process tool calls
-            let tool_calls = body.message.tool_calls.unwrap();
+            let tool_calls = final_resp.message.tool_calls.unwrap();
+            println!(
+                "[ollama] chat_with_tools round {} — {} tool call(s): [{}]",
+                round + 1,
+                tool_calls.len(),
+                tool_calls.iter().map(|tc| tc.function.name.as_str()).collect::<Vec<_>>().join(", ")
+            );
 
-            // Add the assistant message with tool_calls to conversation
             let tc_for_message: Vec<ToolCall> = tool_calls
                 .iter()
                 .map(|tc| ToolCall {
@@ -250,14 +281,16 @@ impl LlmService for OllamaService {
 
             conversation.push(ChatMessage {
                 role: "assistant".to_string(),
-                content: body.message.content.clone(),
+                content: streamed_content,
                 tool_calls: Some(tc_for_message),
             });
 
-            // Execute each tool call
             for tc in &tool_calls {
                 let tool_name = &tc.function.name;
                 let arguments = &tc.function.arguments;
+
+                println!("[ollama] executing tool {} with args: {}", tool_name, arguments);
+                let exec_start = std::time::Instant::now();
 
                 let _ = tx
                     .send(LlmEvent::ToolCallStarted {
@@ -271,6 +304,14 @@ impl LlmService for OllamaService {
                         Err(e) => (false, format!("Error: {}", e)),
                     };
 
+                println!(
+                    "[ollama] tool {} {} in {:?}: {}",
+                    tool_name,
+                    if success { "succeeded" } else { "failed" },
+                    exec_start.elapsed(),
+                    result_content
+                );
+
                 let _ = tx
                     .send(LlmEvent::ToolCallCompleted(ToolCallEvent {
                         tool_name: tool_name.clone(),
@@ -280,7 +321,6 @@ impl LlmService for OllamaService {
                     }))
                     .await;
 
-                // Add tool result to conversation
                 conversation.push(ChatMessage {
                     role: "tool".to_string(),
                     content: result_content,
@@ -289,31 +329,42 @@ impl LlmService for OllamaService {
             }
         }
 
+        println!("[ollama] chat_with_tools exceeded max rounds after {:?}", overall_start.elapsed());
         Err("Tool calling loop exceeded maximum rounds".to_string())
     }
 
     async fn is_healthy(&self) -> bool {
-        self.client
+        println!("[ollama] health check GET {}", self.base_url);
+        let result = self
+            .client
             .get(&self.base_url)
             .send()
             .await
             .map(|r| r.status().is_success())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        println!("[ollama] health check: {}", if result { "healthy" } else { "unreachable" });
+        result
     }
 
     async fn list_models(&self) -> Result<Vec<String>, String> {
+        println!("[ollama] GET /api/tags");
         let response = self
             .client
             .get(format!("{}/api/tags", self.base_url))
             .send()
             .await
-            .map_err(|e| format!("Failed to list models: {}", e))?;
+            .map_err(|e| {
+                println!("[ollama] GET /api/tags FAILED: {}", e);
+                format!("Failed to list models: {}", e)
+            })?;
 
         let tags: OllamaTagsResponse = response
             .json()
             .await
             .map_err(|e| format!("Failed to parse model list: {}", e))?;
 
-        Ok(tags.models.into_iter().map(|m| m.name).collect())
+        let names: Vec<String> = tags.models.into_iter().map(|m| m.name).collect();
+        println!("[ollama] listed {} models", names.len());
+        Ok(names)
     }
 }

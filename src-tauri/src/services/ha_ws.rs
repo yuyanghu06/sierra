@@ -56,10 +56,6 @@ impl HaWebSocketClient {
         }
     }
 
-    pub async fn is_connected(&self) -> bool {
-        *self.connected.read().await
-    }
-
     pub async fn subscribe(
         &self,
         on_state_change: StateCallback,

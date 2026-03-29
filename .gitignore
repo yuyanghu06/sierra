@@ -50,3 +50,6 @@ src-tauri/target/
 
 # Claude Code
 .claude/
+
+# Copilot Code
+copilot-instructions.md

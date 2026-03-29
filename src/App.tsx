@@ -110,13 +110,16 @@ function App() {
   }, []);
 
   useEffect(() => {
-    checkDependencies()
-      .then((status) => {
-        setSetupComplete(status.ollama_installed && status.home_assistant_installed);
+    Promise.all([checkDependencies(), import("./commands/config").then(m => m.getConfig())])
+      .then(([status, cfg]) => {
+        console.log("[setup] dependencies:", status);
+        const depsReady = status.ollamaInstalled && status.homeAssistantInstalled;
+        const configured = !!(cfg.ha_token && cfg.ollama_model);
+        setSetupComplete(depsReady && configured);
       })
-      .catch(() => {
-        // If check fails, assume setup is needed but don't block the app
-        setSetupComplete(true);
+      .catch((e) => {
+        console.error("[setup] check failed:", e);
+        setSetupComplete(false);
       });
   }, []);
 

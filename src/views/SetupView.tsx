@@ -1,63 +1,84 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   checkDependencies,
   installOllama,
   installHomeAssistant,
   pullModel,
   startServices,
+  testHaConnection,
   type DependencyStatus,
   type InstallProgressEvent,
   type PullProgressEvent,
+  type HaConnectionStatus,
 } from "../commands/setup";
-import { listModels, checkOllamaHealth } from "../commands/chat";
+import { listModels } from "../commands/chat";
 import { saveConfig, getConfig } from "../commands/config";
+import { checkHaHealth } from "../commands/devices";
 
-type SetupStep = "check" | "install" | "startingOllama" | "model" | "ready";
+type SetupStep = "check" | "install" | "ha-onboarding" | "model" | "done";
 
-interface StepState {
-  ollamaInstalling: boolean;
-  ollamaProgress: string;
-  ollamaError: string | null;
-  haInstalling: boolean;
-  haProgress: string;
-  haError: string | null;
-  modelPulling: boolean;
-  modelProgress: string;
-  modelError: string | null;
-}
+const DEFAULT_MODEL = "qwen3.5:4b";
+const DEFAULT_HA_URL = "http://localhost:8123";
 
 export default function SetupView({ onComplete }: { onComplete: () => void }) {
   const [step, setStep] = useState<SetupStep>("check");
   const [deps, setDeps] = useState<DependencyStatus | null>(null);
-  const [models, setModels] = useState<string[]>([]);
-  const [selectedModel, setSelectedModel] = useState("");
-  const [customModel, setCustomModel] = useState("");
+
+  // Install step
+  const [ollamaInstalling, setOllamaInstalling] = useState(false);
+  const [ollamaProgress, setOllamaProgress] = useState("");
+  const [ollamaError, setOllamaError] = useState<string | null>(null);
+  const [haInstalling, setHaInstalling] = useState(false);
+  const [haProgress, setHaProgress] = useState("");
+  const [haError, setHaError] = useState<string | null>(null);
+
+  // HA onboarding step
+  const [haStarting, setHaStarting] = useState(false);
+  const [haLive, setHaLive] = useState(false);
+  const [haToken, setHaToken] = useState("");
+  const [tokenStatus, setTokenStatus] = useState<HaConnectionStatus | null>(null);
+  const [tokenTesting, setTokenTesting] = useState(false);
+  const haPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Model step
+  const [modelProgress, setModelProgress] = useState("");
+  const [modelError, setModelError] = useState<string | null>(null);
   const [modelReady, setModelReady] = useState(false);
-  const [startingServices, setStartingServices] = useState(false);
-  const [stepState, setStepState] = useState<StepState>({
-    ollamaInstalling: false,
-    ollamaProgress: "",
-    ollamaError: null,
-    haInstalling: false,
-    haProgress: "",
-    haError: null,
-    modelPulling: false,
-    modelProgress: "",
-    modelError: null,
-  });
+  const [fallbackModel, setFallbackModel] = useState("");
+  const [models, setModels] = useState<string[]>([]);
 
   useEffect(() => {
     runCheck();
   }, []);
 
+  // Auto-start HA polling when entering ha-onboarding
+  useEffect(() => {
+    if (step !== "ha-onboarding") return;
+    startServicesAndPollHa();
+    return () => {
+      if (haPollingRef.current) clearInterval(haPollingRef.current);
+    };
+  }, [step]);
+
+  // Auto-download default model when entering model step
+  useEffect(() => {
+    if (step !== "model") return;
+    loadInstalledModels().then((installed) => {
+      if (installed.includes(DEFAULT_MODEL)) {
+        setModelReady(true);
+        setModelProgress("Ready");
+      } else {
+        downloadDefaultModel();
+      }
+    });
+  }, [step]);
+
   async function runCheck() {
     try {
       const status = await checkDependencies();
       setDeps(status);
-
-      if (status.ollama_installed && status.home_assistant_installed) {
-        // Both installed — start Ollama and go to model step
-        await ensureOllamaRunningThenModelStep();
+      if (status.ollamaInstalled && status.homeAssistantInstalled) {
+        setStep("ha-onboarding");
       } else {
         setStep("install");
       }
@@ -67,265 +88,183 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
     }
   }
 
-  async function ensureOllamaRunningThenModelStep() {
-    setStep("startingOllama");
-
-    // First try starting services so Ollama is running
+  async function startServicesAndPollHa() {
+    setHaStarting(true);
+    setHaLive(false);
     try {
       await startServices();
     } catch {
-      // May fail if services aren't installed as managed — that's ok
+      // ignore — HA may already be starting from app launch
     }
 
-    // Poll until Ollama is healthy (up to 30s)
-    let healthy = false;
-    for (let i = 0; i < 30; i++) {
+    // Poll :8123 until HA responds (up to 3 min for first run)
+    let elapsed = 0;
+    haPollingRef.current = setInterval(async () => {
+      elapsed += 2;
       try {
-        healthy = await checkOllamaHealth();
-        if (healthy) break;
+        const alive = await checkHaHealth();
+        if (alive) {
+          clearInterval(haPollingRef.current!);
+          setHaStarting(false);
+          setHaLive(true);
+        }
       } catch {
-        // ignore
+        // not yet
       }
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-
-    if (!healthy) {
-      // Ollama didn't come up — still go to model step, user may need to start it
-      setStep("model");
-      return;
-    }
-
-    // Ollama is running, load models and go to model step
-    await loadModels();
-    setStep("model");
+      if (elapsed >= 180) {
+        clearInterval(haPollingRef.current!);
+        setHaStarting(false);
+        // Show HA URL anyway so user can try manually
+        setHaLive(true);
+      }
+    }, 2000);
   }
 
-  async function loadModels() {
+  async function loadInstalledModels() {
     try {
       const list = await listModels();
       setModels(list);
-      if (list.length > 0 && !selectedModel) {
-        setSelectedModel(list[0]);
-        setModelReady(true);
-      }
+      return list;
     } catch {
-      setModels([]);
+      return [];
+    }
+  }
+
+  async function downloadDefaultModel() {
+    setModelProgress("Starting download...");
+    setModelError(null);
+    setModelReady(false);
+    try {
+      await pullModel(DEFAULT_MODEL, (event: PullProgressEvent) => {
+        switch (event.event) {
+          case "downloading":
+            setModelProgress(`Downloading ${DEFAULT_MODEL}… ${Math.round(event.data.percent)}%`);
+            break;
+          case "verifying":
+            setModelProgress("Verifying...");
+            break;
+          case "completed":
+            setModelProgress(`${DEFAULT_MODEL} ready`);
+            break;
+          case "failed":
+            setModelError(event.data.error);
+            setModelProgress("");
+            break;
+        }
+      });
+      setModelReady(true);
+      await loadInstalledModels();
+    } catch (e) {
+      setModelError(String(e));
+      setModelProgress("");
     }
   }
 
   async function handleInstallOllama() {
-    setStepState((s) => ({
-      ...s,
-      ollamaInstalling: true,
-      ollamaProgress: "Starting...",
-      ollamaError: null,
-    }));
-
+    setOllamaInstalling(true);
+    setOllamaProgress("Starting...");
+    setOllamaError(null);
     try {
       await installOllama((event: InstallProgressEvent) => {
-        switch (event.event) {
-          case "started":
-            setStepState((s) => ({ ...s, ollamaProgress: "Starting installation..." }));
-            break;
-          case "downloading":
-            setStepState((s) => ({
-              ...s,
-              ollamaProgress: `Downloading... ${Math.round(event.data.percent)}%`,
-            }));
-            break;
-          case "installing":
-            setStepState((s) => ({ ...s, ollamaProgress: "Installing..." }));
-            break;
-          case "completed":
-            setStepState((s) => ({
-              ...s,
-              ollamaInstalling: false,
-              ollamaProgress: "Installed",
-            }));
-            setDeps((d) => (d ? { ...d, ollama_installed: true } : d));
-            break;
-          case "failed":
-            setStepState((s) => ({
-              ...s,
-              ollamaInstalling: false,
-              ollamaError: event.data.error,
-              ollamaProgress: "",
-            }));
-            break;
-        }
+        if (event.event === "started") setOllamaProgress("Starting installation...");
+        else if (event.event === "downloading") setOllamaProgress(`Downloading… ${Math.round(event.data.percent)}%`);
+        else if (event.event === "installing") setOllamaProgress("Installing...");
+        else if (event.event === "completed") { setOllamaProgress("Installed"); setDeps((d) => d ? { ...d, ollamaInstalled: true } : d); }
+        else if (event.event === "failed") { setOllamaError(event.data.error); setOllamaProgress(""); }
       });
     } catch (e) {
-      setStepState((s) => ({
-        ...s,
-        ollamaInstalling: false,
-        ollamaError: String(e),
-        ollamaProgress: "",
-      }));
+      setOllamaError(String(e));
+      setOllamaProgress("");
     }
+    setOllamaInstalling(false);
   }
 
   async function handleInstallHa() {
-    setStepState((s) => ({
-      ...s,
-      haInstalling: true,
-      haProgress: "Starting...",
-      haError: null,
-    }));
-
+    setHaInstalling(true);
+    setHaProgress("Starting...");
+    setHaError(null);
     try {
       await installHomeAssistant((event: InstallProgressEvent) => {
-        switch (event.event) {
-          case "started":
-            setStepState((s) => ({ ...s, haProgress: "Starting installation..." }));
-            break;
-          case "downloading":
-            setStepState((s) => ({
-              ...s,
-              haProgress: `Installing packages... ${Math.round(event.data.percent)}%`,
-            }));
-            break;
-          case "installing":
-            setStepState((s) => ({ ...s, haProgress: "Creating virtual environment..." }));
-            break;
-          case "configuring":
-            setStepState((s) => ({ ...s, haProgress: "Configuring..." }));
-            break;
-          case "completed":
-            setStepState((s) => ({
-              ...s,
-              haInstalling: false,
-              haProgress: "Installed",
-            }));
-            setDeps((d) => (d ? { ...d, home_assistant_installed: true } : d));
-            break;
-          case "failed":
-            setStepState((s) => ({
-              ...s,
-              haInstalling: false,
-              haError: event.data.error,
-              haProgress: "",
-            }));
-            break;
-        }
+        if (event.event === "started") setHaProgress("Starting installation...");
+        else if (event.event === "downloading") setHaProgress(`Installing packages… ${Math.round(event.data.percent)}%`);
+        else if (event.event === "installing") setHaProgress("Creating virtual environment...");
+        else if (event.event === "configuring") setHaProgress("Configuring...");
+        else if (event.event === "completed") { setHaProgress("Installed"); setDeps((d) => d ? { ...d, homeAssistantInstalled: true } : d); }
+        else if (event.event === "failed") { setHaError(event.data.error); setHaProgress(""); }
       });
     } catch (e) {
-      setStepState((s) => ({
-        ...s,
-        haInstalling: false,
-        haError: String(e),
-        haProgress: "",
-      }));
+      setHaError(String(e));
+      setHaProgress("");
     }
+    setHaInstalling(false);
   }
 
-  async function handleContinueToModel() {
-    await ensureOllamaRunningThenModelStep();
-  }
-
-  async function handlePullModel() {
-    const modelName = customModel.trim() || selectedModel;
-    if (!modelName) return;
-
-    setModelReady(false);
-    setStepState((s) => ({
-      ...s,
-      modelPulling: true,
-      modelProgress: "Starting download...",
-      modelError: null,
-    }));
-
+  async function handleTestToken() {
+    if (!haToken.trim()) return;
+    setTokenTesting(true);
+    setTokenStatus(null);
     try {
-      await pullModel(modelName, (event: PullProgressEvent) => {
-        switch (event.event) {
-          case "downloading":
-            setStepState((s) => ({
-              ...s,
-              modelProgress: `Downloading... ${Math.round(event.data.percent)}%`,
-            }));
-            break;
-          case "verifying":
-            setStepState((s) => ({ ...s, modelProgress: "Verifying..." }));
-            break;
-          case "completed":
-            setStepState((s) => ({
-              ...s,
-              modelPulling: false,
-              modelProgress: "Ready",
-            }));
-            break;
-          case "failed":
-            setStepState((s) => ({
-              ...s,
-              modelPulling: false,
-              modelError: event.data.error,
-              modelProgress: "",
-            }));
-            break;
-        }
+      const result = await testHaConnection(DEFAULT_HA_URL, haToken.trim());
+      setTokenStatus(result);
+    } catch {
+      setTokenStatus({ status: "unreachable" });
+    }
+    setTokenTesting(false);
+  }
+
+  async function handleSaveTokenAndContinue() {
+    const cfg = await getConfig();
+    await saveConfig({ ...cfg, ha_url: DEFAULT_HA_URL, ha_token: haToken.trim() });
+    setStep("model");
+  }
+
+  async function handleFallbackDownload() {
+    const model = fallbackModel.trim() || DEFAULT_MODEL;
+    setFallbackModel("");
+    setModelProgress("Starting download...");
+    setModelError(null);
+    setModelReady(false);
+    try {
+      await pullModel(model, (event: PullProgressEvent) => {
+        if (event.event === "downloading") setModelProgress(`Downloading ${model}… ${Math.round(event.data.percent)}%`);
+        else if (event.event === "verifying") setModelProgress("Verifying...");
+        else if (event.event === "completed") setModelProgress(`${model} ready`);
+        else if (event.event === "failed") { setModelError(event.data.error); setModelProgress(""); }
       });
-
-      // Model pulled successfully — select it and mark ready
-      const pulledName = customModel.trim() || selectedModel;
-      setSelectedModel(pulledName);
-      setCustomModel("");
       setModelReady(true);
-
-      // Refresh model list
-      await loadModels();
+      await loadInstalledModels();
     } catch (e) {
-      setStepState((s) => ({
-        ...s,
-        modelPulling: false,
-        modelError: String(e),
-        modelProgress: "",
-      }));
+      setModelError(String(e));
     }
   }
 
-  function handleSelectExistingModel(model: string) {
-    setSelectedModel(model);
+  async function handleSelectExisting(model: string) {
+    setModelProgress(`${model} selected`);
     setModelReady(true);
   }
 
   async function handleFinish() {
-    setStartingServices(true);
-    try {
-      // Save the selected model to config
-      const cfg = await getConfig();
-      await saveConfig({
-        ...cfg,
-        ollama_model: selectedModel || null,
-      });
-
-      // Start remaining services (HA if not already running)
-      await startServices();
-    } catch {
-      // Services will start on their own
-    }
-    setStartingServices(false);
+    const cfg = await getConfig();
+    await saveConfig({
+      ...cfg,
+      ollama_model: (models.includes(DEFAULT_MODEL) ? DEFAULT_MODEL : models[0]) || null,
+    });
     onComplete();
   }
 
-  const bothInstalled = deps?.ollama_installed && deps?.home_assistant_installed;
+  const bothInstalled = deps?.ollamaInstalled && deps?.homeAssistantInstalled;
+  const tokenConnected = tokenStatus?.status === "connected";
 
   return (
     <div className="setup-view">
       <div className="setup-card">
         <div className="setup-header">
-          <img
-            className="setup-logo"
-            src="/sierra-logo.png"
-            alt="Sierra"
-            width="40"
-            height="40"
-          />
+          <img className="setup-logo" src="/sierra-logo.png" alt="Sierra" width="40" height="40" />
           <h1 className="setup-title">Welcome to Sierra</h1>
-          <p className="setup-subtitle">
-            Sierra needs two services to control your smart home.
-          </p>
+          <p className="setup-subtitle">Local natural-language smart home control.</p>
         </div>
 
-        {/* Step: Checking */}
+        {/* Checking */}
         {step === "check" && (
           <div className="setup-body">
             <div className="setup-checking">
@@ -335,98 +274,33 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
           </div>
         )}
 
-        {/* Step: Starting Ollama */}
-        {step === "startingOllama" && (
-          <div className="setup-body">
-            <div className="setup-checking">
-              <span className="setup-spinner" />
-              <span>Starting Ollama...</span>
-            </div>
-          </div>
-        )}
-
-        {/* Step: Install dependencies */}
+        {/* Install dependencies */}
         {step === "install" && (
           <div className="setup-body">
-            {/* Ollama */}
-            <div className="setup-dep">
-              <div className="setup-dep-row">
-                <div className="setup-dep-info">
-                  <span
-                    className={`setup-dep-check ${deps?.ollama_installed ? "setup-dep-check-ok" : ""}`}
-                  >
-                    {deps?.ollama_installed ? "\u2713" : "\u2022"}
-                  </span>
-                  <div>
-                    <span className="setup-dep-name">Ollama</span>
-                    <span className="setup-dep-desc">Local LLM inference</span>
-                  </div>
-                </div>
-                {!deps?.ollama_installed && (
-                  <button
-                    className="form-btn form-btn-primary"
-                    onClick={handleInstallOllama}
-                    disabled={stepState.ollamaInstalling}
-                  >
-                    {stepState.ollamaInstalling ? "Installing..." : "Install"}
-                  </button>
-                )}
-                {deps?.ollama_installed && (
-                  <span className="setup-dep-installed">Installed</span>
-                )}
-              </div>
-              {stepState.ollamaProgress && (
-                <div className="setup-dep-progress">{stepState.ollamaProgress}</div>
-              )}
-              {stepState.ollamaError && (
-                <div className="setup-dep-error">{stepState.ollamaError}</div>
-              )}
-            </div>
-
-            {/* Home Assistant */}
-            <div className="setup-dep">
-              <div className="setup-dep-row">
-                <div className="setup-dep-info">
-                  <span
-                    className={`setup-dep-check ${deps?.home_assistant_installed ? "setup-dep-check-ok" : ""}`}
-                  >
-                    {deps?.home_assistant_installed ? "\u2713" : "\u2022"}
-                  </span>
-                  <div>
-                    <span className="setup-dep-name">Home Assistant</span>
-                    <span className="setup-dep-desc">Smart home device bridge</span>
-                  </div>
-                </div>
-                {!deps?.home_assistant_installed && (
-                  <button
-                    className="form-btn form-btn-primary"
-                    onClick={handleInstallHa}
-                    disabled={stepState.haInstalling || !deps?.python_available}
-                  >
-                    {stepState.haInstalling ? "Installing..." : "Install"}
-                  </button>
-                )}
-                {deps?.home_assistant_installed && (
-                  <span className="setup-dep-installed">Installed</span>
-                )}
-              </div>
-              {!deps?.python_available && !deps?.home_assistant_installed && (
-                <div className="setup-dep-error">
-                  Python 3.12+ is required. Please install Python first.
-                </div>
-              )}
-              {stepState.haProgress && (
-                <div className="setup-dep-progress">{stepState.haProgress}</div>
-              )}
-              {stepState.haError && (
-                <div className="setup-dep-error">{stepState.haError}</div>
-              )}
-            </div>
-
+            <SetupDep
+              name="Ollama"
+              desc="Local LLM inference"
+              installed={!!deps?.ollamaInstalled}
+              installing={ollamaInstalling}
+              progress={ollamaProgress}
+              error={ollamaError}
+              onInstall={handleInstallOllama}
+            />
+            <SetupDep
+              name="Home Assistant"
+              desc="Smart home device bridge"
+              installed={!!deps?.homeAssistantInstalled}
+              installing={haInstalling}
+              progress={haProgress}
+              error={haError}
+              onInstall={handleInstallHa}
+              disabled={!deps?.pythonAvailable}
+              disabledReason={!deps?.pythonAvailable ? "Python 3.12+ is required. Please install Python first." : undefined}
+            />
             <div className="setup-actions">
               <button
                 className="form-btn form-btn-primary"
-                onClick={handleContinueToModel}
+                onClick={() => setStep("ha-onboarding")}
                 disabled={!bothInstalled}
               >
                 Continue
@@ -435,83 +309,151 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
           </div>
         )}
 
-        {/* Step: Model selection */}
-        {step === "model" && (
+        {/* HA Onboarding */}
+        {step === "ha-onboarding" && (
           <div className="setup-body">
             <div className="setup-section">
-              <h3 className="setup-section-title">Choose a Model</h3>
-              <p className="setup-section-desc">
-                Select an LLM model to power Sierra. Models with tool calling
-                support work best. You need at least one model to continue.
-              </p>
+              <h3 className="setup-section-title">Connect Home Assistant</h3>
 
-              {models.length > 0 && (
-                <div className="setup-model-list">
-                  <label className="settings-field-label" htmlFor="setup-model">
-                    Installed Models
-                  </label>
-                  <select
-                    id="setup-model"
-                    className="form-select"
-                    value={selectedModel}
-                    onChange={(e) => handleSelectExistingModel(e.target.value)}
-                  >
-                    {!selectedModel && (
-                      <option value="" disabled>
-                        Select a model...
-                      </option>
-                    )}
-                    {models.map((m) => (
-                      <option key={m} value={m}>
-                        {m}
-                      </option>
-                    ))}
-                  </select>
+              {haStarting && (
+                <div className="setup-checking setup-checking-inline">
+                  <span className="setup-spinner" />
+                  <span>Starting Home Assistant…</span>
                 </div>
               )}
 
-              <div className="setup-model-pull">
-                <label className="settings-field-label" htmlFor="setup-custom-model">
-                  {models.length > 0
-                    ? "Or download a different model"
-                    : "Download a Model"}
-                </label>
-                <div className="setup-model-pull-row">
-                  <input
-                    id="setup-custom-model"
-                    className="form-input"
-                    type="text"
-                    value={customModel}
-                    onChange={(e) => setCustomModel(e.target.value)}
-                    placeholder="e.g., llama3.2, qwen3.5:4b, mistral"
-                  />
-                  <button
-                    className="form-btn form-btn-primary"
-                    onClick={handlePullModel}
-                    disabled={
-                      stepState.modelPulling ||
-                      (!customModel.trim() && !selectedModel)
-                    }
-                  >
-                    {stepState.modelPulling ? "Downloading..." : "Download"}
-                  </button>
+              {haLive && (
+                <>
+                  <div className="setup-onboarding-steps">
+                    <p className="setup-onboarding-intro">
+                      Home Assistant is running. Follow these steps to connect Sierra:
+                    </p>
+                    <ol className="setup-onboarding-list">
+                      <li>
+                        Open{" "}
+                      <a
+                          href={DEFAULT_HA_URL}
+                          className="setup-link"
+                          onClick={(e) => e.preventDefault()}
+                        >
+                          {DEFAULT_HA_URL}
+                        </a>{" "}
+                        in your browser
+                      </li>
+                      <li>Create your Home Assistant account when prompted</li>
+                      <li>
+                        Once logged in, click your profile avatar (bottom-left) →{" "}
+                        <strong>Profile</strong>
+                      </li>
+                      <li>
+                        Scroll down to <strong>Long-Lived Access Tokens</strong> and click{" "}
+                        <strong>Create Token</strong>
+                      </li>
+                      <li>Give it any name (e.g. "Sierra"), then copy the token</li>
+                      <li>Paste it below and click <strong>Test Connection</strong></li>
+                    </ol>
+                  </div>
+
+                  <div className="setup-token-row">
+                    <input
+                      className="form-input"
+                      type="password"
+                      placeholder="Paste your Long-Lived Access Token here"
+                      value={haToken}
+                      onChange={(e) => { setHaToken(e.target.value); setTokenStatus(null); }}
+                    />
+                    <button
+                      className="form-btn form-btn-primary"
+                      onClick={handleTestToken}
+                      disabled={tokenTesting || !haToken.trim()}
+                    >
+                      {tokenTesting ? "Testing…" : "Test"}
+                    </button>
+                  </div>
+
+                  {tokenStatus && (
+                    <div className={`setup-token-status ${tokenConnected ? "setup-token-status-ok" : tokenStatus.status === "needsOnboarding" ? "setup-token-status-warn" : "setup-token-status-err"}`}>
+                      {tokenConnected && "✓ Connected — Sierra can reach Home Assistant"}
+                      {tokenStatus.status === "needsOnboarding" && `Complete setup at ${DEFAULT_HA_URL} first, then generate a token`}
+                      {tokenStatus.status === "invalidToken" && "Token not recognised — make sure you copied the full token"}
+                      {tokenStatus.status === "unreachable" && `Home Assistant isn't responding at ${DEFAULT_HA_URL}`}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+
+            <div className="setup-actions">
+              <button
+                className="form-btn form-btn-primary"
+                onClick={handleSaveTokenAndContinue}
+                disabled={!tokenConnected}
+              >
+                Continue
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Model download */}
+        {step === "model" && (
+          <div className="setup-body">
+            <div className="setup-section">
+              <h3 className="setup-section-title">Downloading AI Model</h3>
+              <p className="setup-section-desc">
+                Sierra uses <strong>{DEFAULT_MODEL}</strong> as its default model.
+                This is a one-time download (~2.6 GB).
+              </p>
+
+              {modelProgress && !modelError && (
+                <div className="setup-model-progress">
+                  {!modelReady && <span className="setup-spinner setup-spinner-sm" />}
+                  <span>{modelProgress}</span>
                 </div>
-                {stepState.modelProgress && (
-                  <div className="setup-dep-progress">{stepState.modelProgress}</div>
-                )}
-                {stepState.modelError && (
-                  <div className="setup-dep-error">{stepState.modelError}</div>
-                )}
-              </div>
+              )}
+
+              {modelError && (
+                <div className="setup-dep-error">
+                  <p>Download failed: {modelError}</p>
+                  <p className="setup-error-sub">
+                    Make sure Ollama is running, then retry or enter a different model name.
+                  </p>
+                  <div className="setup-model-pull-row">
+                    <input
+                      className="form-input"
+                      type="text"
+                      placeholder={`Retry ${DEFAULT_MODEL} or enter another model`}
+                      value={fallbackModel}
+                      onChange={(e) => setFallbackModel(e.target.value)}
+                    />
+                    <button className="form-btn form-btn-primary" onClick={handleFallbackDownload}>
+                      Download
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {models.length > 1 && !modelReady && !modelError && (
+                <div className="setup-model-existing">
+                  <p className="settings-field-label">Or use an existing model</p>
+                  <div className="setup-model-existing-list">
+                    {models.filter((m) => m !== DEFAULT_MODEL).map((m) => (
+                      <button key={m} className="setup-model-chip" onClick={() => handleSelectExisting(m)}>
+                        {m}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="setup-actions">
               <button
                 className="form-btn form-btn-primary"
                 onClick={handleFinish}
-                disabled={!modelReady || startingServices || stepState.modelPulling}
+                disabled={!modelReady}
               >
-                {startingServices ? "Starting..." : "Get Started"}
+                Get Started
               </button>
             </div>
           </div>
@@ -520,3 +462,52 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
     </div>
   );
 }
+
+/* ── Sub-components ────────────────────────────────────────────────────────── */
+
+function SetupDep({
+  name, desc, installed, installing, progress, error, onInstall, disabled, disabledReason,
+}: {
+  name: string;
+  desc: string;
+  installed: boolean;
+  installing: boolean;
+  progress: string;
+  error: string | null;
+  onInstall: () => void;
+  disabled?: boolean;
+  disabledReason?: string;
+}) {
+  return (
+    <div className="setup-dep">
+      <div className="setup-dep-row">
+        <div className="setup-dep-info">
+          <span className={`setup-dep-check ${installed ? "setup-dep-check-ok" : ""}`}>
+            {installed ? "✓" : "•"}
+          </span>
+          <div>
+            <span className="setup-dep-name">{name}</span>
+            <span className="setup-dep-desc">{desc}</span>
+          </div>
+        </div>
+        {!installed ? (
+          <button
+            className="form-btn form-btn-primary"
+            onClick={onInstall}
+            disabled={installing || disabled}
+          >
+            {installing ? "Installing…" : "Install"}
+          </button>
+        ) : (
+          <span className="setup-dep-installed">Installed</span>
+        )}
+      </div>
+      {disabledReason && !installed && (
+        <div className="setup-dep-error">{disabledReason}</div>
+      )}
+      {progress && <div className="setup-dep-progress">{progress}</div>}
+      {error && <div className="setup-dep-error">{error}</div>}
+    </div>
+  );
+}
+

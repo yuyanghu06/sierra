@@ -22,10 +22,8 @@ pub enum ServiceStatus {
 }
 
 pub struct ManagedService {
-    pub name: String,
     pub status: ServiceStatus,
     pub process: Option<Child>,
-    pub port: u16,
     pub max_restarts: u32,
     pub restart_count: u32,
     /// If true, we detected an externally-running instance and won't manage it
@@ -36,6 +34,7 @@ pub struct ProcessManager {
     pub ollama: RwLock<ManagedService>,
     pub home_assistant: RwLock<ManagedService>,
     app_data_dir: PathBuf,
+    ha_venv_dir: PathBuf,
     log_dir: PathBuf,
 }
 
@@ -44,42 +43,27 @@ impl ProcessManager {
         // Ensure log directory exists
         let _ = std::fs::create_dir_all(&log_dir);
 
+        let ha_venv_dir = super::installer::ha_venv_dir();
+
         Self {
             ollama: RwLock::new(ManagedService {
-                name: "Ollama".to_string(),
                 status: ServiceStatus::NotInstalled,
                 process: None,
-                port: 11434,
                 max_restarts: 3,
                 restart_count: 0,
                 is_external: false,
             }),
             home_assistant: RwLock::new(ManagedService {
-                name: "Home Assistant".to_string(),
                 status: ServiceStatus::NotInstalled,
                 process: None,
-                port: 8123,
                 max_restarts: 3,
                 restart_count: 0,
                 is_external: false,
             }),
             app_data_dir,
+            ha_venv_dir,
             log_dir,
         }
-    }
-
-    /// Check if a port is already in use by trying a health check
-    pub async fn is_port_in_use(&self, port: u16) -> bool {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap_or_default();
-
-        client
-            .get(format!("http://localhost:{}", port))
-            .send()
-            .await
-            .is_ok()
     }
 
     /// Check if Ollama is healthy on its port
@@ -114,6 +98,55 @@ impl ProcessManager {
         }
     }
 
+}
+
+/// Kill any process currently listening on port 8123 (stale HA instances).
+/// Uses platform-specific tools to find and SIGKILL the process.
+pub fn kill_process_on_port_8123() {
+    #[cfg(unix)]
+    {
+        // lsof -ti :8123 returns the PID(s) using the port
+        if let Ok(output) = Command::new("lsof")
+            .args(["-ti", ":8123"])
+            .output()
+        {
+            let pids = String::from_utf8_lossy(&output.stdout);
+            for pid_str in pids.split_whitespace() {
+                if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                    println!("[HA] killing stale process on :8123 (pid: {})", pid);
+                    unsafe { libc::kill(pid, libc::SIGKILL); }
+                }
+            }
+            // Give the OS a moment to reclaim the port
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // netstat -ano | findstr :8123, then taskkill /F /PID <pid>
+        if let Ok(output) = Command::new("netstat")
+            .args(["-ano"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                if line.contains(":8123") && line.contains("LISTENING") {
+                    let pid = line.split_whitespace().last().unwrap_or("").trim();
+                    if !pid.is_empty() {
+                        println!("[HA] killing stale process on :8123 (pid: {})", pid);
+                        let _ = Command::new("taskkill")
+                            .args(["/F", "/PID", pid])
+                            .output();
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+}
+
+impl ProcessManager {
     /// Detect if Ollama is already running externally
     pub async fn detect_external_ollama(&self) -> bool {
         self.check_ollama_health().await
@@ -195,9 +228,10 @@ impl ProcessManager {
         }
     }
 
-    /// Find the Home Assistant (hass) binary in our managed venv
+    /// Find the Home Assistant (hass) binary — checks managed venv first, then system PATH
     pub fn find_ha_binary(&self) -> Option<PathBuf> {
-        let venv = self.app_data_dir.join("ha-venv");
+        // 1. Check managed venv (space-free path — see installer::ha_venv_dir() for rationale)
+        let venv = &self.ha_venv_dir;
 
         #[cfg(target_os = "macos")]
         let hass = venv.join("bin/hass");
@@ -209,10 +243,40 @@ impl ProcessManager {
         let hass = venv.join("bin/hass");
 
         if hass.exists() {
-            Some(hass)
-        } else {
-            None
+            return Some(hass);
         }
+
+        // 2. Check system PATH
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(output) = Command::new("which").arg("hass").output() {
+                if output.status.success() {
+                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !path.is_empty() {
+                        return Some(PathBuf::from(path));
+                    }
+                }
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(output) = Command::new("where").arg("hass").output() {
+                if output.status.success() {
+                    let path = String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if !path.is_empty() {
+                        return Some(PathBuf::from(path));
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     /// Start Ollama as a child process
@@ -289,17 +353,19 @@ impl ProcessManager {
     pub async fn start_ha(&self) -> Result<(), String> {
         {
             let svc = self.home_assistant.read().await;
-            if svc.is_external {
-                return Ok(());
-            }
             if svc.status == ServiceStatus::Running {
+                println!("[HA] already running");
                 return Ok(());
             }
         }
 
+        println!("[HA] starting Home Assistant...");
+
         let binary = self
             .find_ha_binary()
             .ok_or_else(|| "Home Assistant not installed in managed venv".to_string())?;
+
+        println!("[HA] binary:  {}", binary.display());
 
         {
             let mut svc = self.home_assistant.write().await;
@@ -308,8 +374,11 @@ impl ProcessManager {
 
         let ha_config_dir = self.app_data_dir.join("ha-config");
         let _ = std::fs::create_dir_all(&ha_config_dir);
+        println!("[HA] config:  {}", ha_config_dir.display());
 
         let log_path = self.log_dir.join("homeassistant.log");
+        println!("[HA] log:     {}", log_path.display());
+
         let log_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -320,9 +389,34 @@ impl ProcessManager {
             .try_clone()
             .map_err(|e| format!("Failed to clone log handle: {}", e))?;
 
-        let mut cmd = Command::new(binary);
+        let mut cmd = Command::new(&binary);
+
+        // Build a clean PATH without entries containing spaces.
+        // HA's internal pip/uv chokes on PATH entries with spaces (e.g., macOS
+        // "Application Support") — it misparses them as package requirements.
+        let clean_path = {
+            let venv_bin = binary.parent().unwrap_or(std::path::Path::new(""));
+            let original_path = std::env::var("PATH").unwrap_or_default();
+            let mut parts: Vec<&str> = original_path
+                .split(':')
+                .filter(|p| !p.contains(' '))
+                .collect();
+            let venv_str = venv_bin.to_str().unwrap_or("");
+            if !venv_str.is_empty() && !parts.contains(&venv_str) {
+                parts.insert(0, venv_str);
+            }
+            parts.join(":")
+        };
+
         cmd.arg("--config")
             .arg(&ha_config_dir)
+            .env("PATH", &clean_path)
+            .env_remove("PYTHONPATH")
+            .env_remove("PYTHONHOME")
+            .env_remove("PIP_REQUIRE_VIRTUALENV")
+            .env_remove("VIRTUAL_ENV")
+            .env_remove("UV_CONSTRAINT")
+            .env_remove("PIP_CONSTRAINT")
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_file_err));
 
@@ -336,23 +430,32 @@ impl ProcessManager {
             .spawn()
             .map_err(|e| format!("Failed to start Home Assistant: {}", e))?;
 
+        println!("[HA] spawned (pid: {})", child.id());
+
         {
             let mut svc = self.home_assistant.write().await;
             svc.process = Some(child);
         }
 
-        // HA takes longer to start
-        let healthy = self.wait_for_health("home_assistant", 60).await;
+        // HA takes longer to start — first run can take 2+ minutes
+        // (database creation, onboarding setup, dependency installs)
+        const TIMEOUT_SECS: u64 = 180;
+        println!("[HA] waiting for health check on :8123 (timeout: {TIMEOUT_SECS}s)...");
+
+        let healthy = self.wait_for_health("home_assistant", TIMEOUT_SECS).await;
         {
             let mut svc = self.home_assistant.write().await;
             if healthy {
                 svc.status = ServiceStatus::Running;
+                println!("[HA] ✓ running");
             } else {
                 svc.status = ServiceStatus::Crashed {
                     exit_code: None,
                     restarts: svc.restart_count,
                 };
-                return Err("Home Assistant failed to start within 60 seconds".to_string());
+                eprintln!("[HA] ✗ failed to become healthy within {TIMEOUT_SECS}s");
+                eprintln!("[HA]   check log: {}", self.log_dir.join("homeassistant.log").display());
+                return Err(format!("Home Assistant failed to start within {TIMEOUT_SECS} seconds"));
             }
         }
 
@@ -363,6 +466,7 @@ impl ProcessManager {
     async fn wait_for_health(&self, service: &str, timeout_secs: u64) -> bool {
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
+        let mut last_log_secs: u64 = 0;
 
         while start.elapsed() < timeout {
             let healthy = match service {
@@ -373,6 +477,18 @@ impl ProcessManager {
             if healthy {
                 return true;
             }
+
+            let elapsed = start.elapsed().as_secs();
+            if elapsed >= last_log_secs + 10 {
+                let label = match service {
+                    "home_assistant" => "HA",
+                    "ollama" => "Ollama",
+                    other => other,
+                };
+                println!("[{label}] still starting... ({elapsed}s elapsed)");
+                last_log_secs = elapsed;
+            }
+
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         false

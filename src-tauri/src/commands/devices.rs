@@ -42,12 +42,15 @@ pub async fn call_device_action(
     entity_id: String,
     data: Option<serde_json::Value>,
 ) -> Result<(), String> {
-    state
-        .ha
-        .read()
-        .await
-        .call_service(&domain, &service, &entity_id, data)
-        .await
+    let ha = state.ha.read().await;
+    ha.call_service(&domain, &service, &entity_id, data).await?;
+
+    // Refresh entity state in cache after the action
+    if let Ok(new_state) = ha.get_state(&entity_id).await {
+        state.device_cache.update_entity(&entity_id, new_state).await;
+    }
+
+    Ok(())
 }
 
 #[tauri::command]

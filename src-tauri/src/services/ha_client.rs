@@ -42,14 +42,6 @@ impl HaRestClient {
         }
     }
 
-    pub fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    pub fn token(&self) -> &str {
-        &self.token
-    }
-
     fn auth_header(&self) -> String {
         format!("Bearer {}", self.token)
     }
@@ -145,13 +137,90 @@ impl HomeAssistantService for HaRestClient {
     }
 
     async fn is_healthy(&self) -> bool {
+        // Accepts 2xx, 401, and 403 as "HA is alive" — matching process_manager health check.
+        // A 401 means HA is running but the token is missing/invalid; the service is still up.
+        // Use check_connection() when you need to verify auth validity.
         let url = format!("{}/api/", self.base_url);
         self.client
             .get(&url)
             .header("Authorization", self.auth_header())
+            .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
-            .map(|r| r.status().is_success())
+            .map(|r| {
+                let s = r.status().as_u16();
+                s < 500 && s != 404
+            })
             .unwrap_or(false)
+    }
+}
+
+/// Detailed connection status returned by `test_ha_connection`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase", tag = "status")]
+pub enum HaConnectionStatus {
+    /// Token valid, API responding normally.
+    Connected,
+    /// HA is running but onboarding hasn't been completed yet.
+    /// User must visit the HA URL in a browser to create an account.
+    NeedsOnboarding,
+    /// HA is running but the token is missing or invalid (HTTP 401/403).
+    InvalidToken,
+    /// HA is not reachable at the given URL.
+    Unreachable,
+}
+
+impl HaRestClient {
+    /// Detailed connection check — distinguishes between not running, bad token, and onboarding.
+    pub async fn check_connection(&self) -> HaConnectionStatus {
+        let api_url = format!("{}/api/", self.base_url);
+
+        let response = match self
+            .client
+            .get(&api_url)
+            .header("Authorization", self.auth_header())
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return HaConnectionStatus::Unreachable,
+        };
+
+        match response.status().as_u16() {
+            200 => HaConnectionStatus::Connected,
+            401 | 403 => {
+                // HA is up. Check if onboarding is still required.
+                // GET /api/onboarding returns {"done": [...]} without auth.
+                // If "user" is absent from the done list, no real user account exists.
+                let onboarding_url = format!("{}/api/onboarding", self.base_url);
+                let user_step_done = async {
+                    let resp = self
+                        .client
+                        .get(&onboarding_url)
+                        .timeout(std::time::Duration::from_secs(3))
+                        .send()
+                        .await
+                        .ok()?;
+
+                    if !resp.status().is_success() {
+                        return Some(true); // can't read onboarding, assume done
+                    }
+
+                    let json: serde_json::Value = resp.json().await.ok()?;
+                    let done_arr = json.get("done")?.as_array()?;
+                    Some(done_arr.iter().any(|s| s.as_str() == Some("user")))
+                }
+                .await
+                .unwrap_or(true); // if we can't tell, assume onboarding is done
+
+                if user_step_done {
+                    HaConnectionStatus::InvalidToken
+                } else {
+                    HaConnectionStatus::NeedsOnboarding
+                }
+            }
+            _ => HaConnectionStatus::InvalidToken,
+        }
     }
 }

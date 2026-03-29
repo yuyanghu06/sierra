@@ -19,7 +19,12 @@ pub async fn check_dependencies(app_handle: tauri::AppHandle) -> Result<Dependen
         .app_data_dir()
         .map_err(|e| format!("Failed to get app data dir: {}", e))?;
 
-    Ok(installer::detect_dependencies(&app_data_dir))
+    let status = installer::detect_dependencies(&app_data_dir);
+    println!(
+        "[setup] check_dependencies: ollama={} ha={} python={}",
+        status.ollama_installed, status.home_assistant_installed, status.python_available
+    );
+    Ok(status)
 }
 
 #[tauri::command]
@@ -37,7 +42,12 @@ pub async fn install_home_assistant(
         .app_data_dir()
         .map_err(|e| format!("Failed to get app data dir: {}", e))?;
 
-    installer::install_home_assistant(&app_data_dir, &on_progress).await
+    let resource_dir = app_handle
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("Failed to get resource dir: {}", e))?;
+
+    installer::install_home_assistant(&app_data_dir, &resource_dir, &on_progress).await
 }
 
 #[tauri::command]
@@ -79,32 +89,26 @@ pub async fn restart_service(
 pub async fn start_services(
     pm: tauri::State<'_, Arc<ProcessManager>>,
 ) -> Result<ServiceStatusInfo, String> {
-    // Detect external instances first
+    // Reuse external Ollama if already running; otherwise start managed instance
     let ollama_external = pm.detect_external_ollama().await;
-    let ha_external = pm.detect_external_ha().await;
-
     if ollama_external {
         let mut svc = pm.ollama.write().await;
         svc.is_external = true;
         svc.status = ServiceStatus::External;
     } else {
-        // Try to start Ollama
         match pm.start_ollama().await {
             Ok(()) => {}
             Err(e) => eprintln!("Failed to start Ollama: {}", e),
         }
     }
 
-    if ha_external {
-        let mut svc = pm.home_assistant.write().await;
-        svc.is_external = true;
-        svc.status = ServiceStatus::External;
-    } else {
-        // Try to start HA
-        match pm.start_ha().await {
-            Ok(()) => {}
-            Err(e) => eprintln!("Failed to start HA: {}", e),
-        }
+    // Always start Sierra's managed HA — kill any stale process on :8123 first
+    if pm.detect_external_ha().await {
+        crate::services::process_manager::kill_process_on_port_8123();
+    }
+    match pm.start_ha().await {
+        Ok(()) => {}
+        Err(e) => eprintln!("Failed to start HA: {}", e),
     }
 
     Ok(ServiceStatusInfo {

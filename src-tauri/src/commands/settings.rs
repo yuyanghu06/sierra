@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::config::AppConfig;
-use crate::services::ha_client::{HaRestClient, HomeAssistantService};
+use crate::services::ha_client::{HaConnectionStatus, HaRestClient};
 use crate::services::ollama::OllamaService;
 use crate::services::tool_executor::HaToolExecutor;
 use crate::state::AppState;
@@ -72,9 +72,9 @@ pub async fn save_config(
 }
 
 #[tauri::command]
-pub async fn test_ha_connection(url: String, token: String) -> Result<bool, String> {
+pub async fn test_ha_connection(url: String, token: String) -> Result<HaConnectionStatus, String> {
     let client = HaRestClient::new(url, token);
-    Ok(client.is_healthy().await)
+    Ok(client.check_connection().await)
 }
 
 #[tauri::command]

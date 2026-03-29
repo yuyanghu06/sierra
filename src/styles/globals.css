@@ -1130,6 +1130,17 @@ body {
   margin-top: 8px;
 }
 
+.settings-status-wrap {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.settings-status-wrap span:last-child {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.5;
+}
+
 .settings-model-row {
   display: flex;
   gap: 8px;
@@ -1575,8 +1586,12 @@ select:focus-visible {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  height: 100vh;
+  flex: 1;
+  width: 100%;
+  height: 100%;
   gap: 16px;
+  position: relative;
+  z-index: 1;
 }
 
 .setup-loading-text {
@@ -1588,8 +1603,12 @@ select:focus-visible {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 100vh;
+  flex: 1;
+  width: 100%;
+  height: 100%;
   padding: 24px;
+  position: relative;
+  z-index: 1;
 }
 
 .setup-card {
@@ -1795,4 +1814,242 @@ select:focus-visible {
 
 .setup-model-pull-row .form-btn {
   flex-shrink: 0;
+}
+
+/* ── Setup: HA onboarding step ──────────────────────────────────────────────── */
+.setup-checking-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 0;
+  font-size: var(--font-body);
+  color: var(--text-secondary);
+}
+
+.setup-onboarding-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.setup-onboarding-intro {
+  font-size: var(--font-body);
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+.setup-onboarding-list {
+  margin: 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: var(--font-body);
+  color: var(--text-primary);
+  line-height: 1.6;
+}
+
+.setup-onboarding-list li strong {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.setup-link {
+  color: var(--color-sunrise);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.setup-token-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.setup-token-row .form-input {
+  flex: 1;
+}
+
+.setup-token-status {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: var(--font-secondary);
+  line-height: 1.5;
+  border: 0.5px solid transparent;
+}
+
+.setup-token-status-ok {
+  background: rgba(100, 150, 110, 0.10);
+  border-color: rgba(100, 150, 110, 0.25);
+  color: rgba(60, 110, 70, 0.9);
+}
+
+.setup-token-status-warn {
+  background: rgba(210, 155, 40, 0.10);
+  border-color: rgba(210, 155, 40, 0.25);
+  color: rgba(140, 90, 20, 0.9);
+}
+
+.setup-token-status-err {
+  background: rgba(200, 60, 50, 0.08);
+  border-color: rgba(200, 60, 50, 0.20);
+  color: rgba(160, 40, 30, 0.9);
+}
+
+/* ── Setup: model download step ─────────────────────────────────────────────── */
+.setup-model-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0;
+  font-size: var(--font-body);
+  color: var(--text-secondary);
+}
+
+.setup-spinner-sm {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.setup-error-sub {
+  margin: 4px 0 8px;
+  font-size: var(--font-secondary);
+  color: var(--text-secondary);
+}
+
+.setup-model-existing {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.setup-model-existing-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.setup-model-chip {
+  padding: 5px 12px;
+  border-radius: 20px;
+  border: 0.5px solid var(--glass-standard-border);
+  background: var(--glass-standard-bg);
+  color: var(--text-secondary);
+  font-size: var(--font-secondary);
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 150ms ease;
+}
+
+.setup-model-chip:hover {
+  background: rgba(255, 248, 240, 0.75);
+}
+
+/* ── Settings: token auto-save indicator ────────────────────────────────────── */
+.settings-token-saved {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: var(--font-secondary);
+  color: rgba(60, 110, 70, 0.9);
+}
+
+/* ── Settings: curated model list ───────────────────────────────────────────── */
+.settings-model-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.settings-model-row-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 0.5px solid var(--glass-standard-border);
+  background: var(--glass-standard-bg);
+  backdrop-filter: blur(24px);
+  transition: border-color 150ms ease;
+}
+
+.settings-model-row-active {
+  border-color: rgba(224, 108, 40, 0.30);
+  background: rgba(224, 108, 40, 0.06);
+}
+
+.settings-model-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.settings-model-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--font-body);
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.settings-model-badge {
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 500;
+  background: rgba(224, 108, 40, 0.12);
+  border: 0.5px solid rgba(224, 108, 40, 0.25);
+  color: var(--color-sunrise);
+  letter-spacing: 0.02em;
+}
+
+.settings-model-meta {
+  font-size: var(--font-secondary);
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.settings-model-desc {
+  font-size: var(--font-secondary);
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.settings-model-error {
+  font-size: var(--font-secondary);
+  color: rgba(160, 40, 30, 0.9);
+  margin-top: 2px;
+}
+
+.settings-model-progress {
+  font-size: var(--font-secondary);
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.settings-model-actions {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  padding-top: 2px;
+}
+
+.settings-model-active-label {
+  font-size: var(--font-secondary);
+  color: var(--color-sunrise);
+  font-weight: 500;
+}
+
+.form-btn-sm {
+  padding: 5px 12px;
+  font-size: var(--font-secondary);
 }

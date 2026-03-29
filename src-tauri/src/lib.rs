@@ -40,7 +40,7 @@ pub fn run() {
             let ollama = OllamaService::new(ollama_url, ollama_model);
 
             let ha_client: Arc<dyn services::ha_client::HomeAssistantService> =
-                Arc::new(HaRestClient::new(ha_url, ha_token));
+                Arc::new(HaRestClient::new(ha_url.clone(), ha_token.clone()));
 
             let device_cache = devices::new_shared_cache();
             let tool_executor: Arc<dyn services::llm::ToolExecutor> =
@@ -89,14 +89,52 @@ pub fn run() {
 
             app.manage(process_manager.clone());
 
+            // Start Ollama and Home Assistant on launch
+            let pm_startup = process_manager.clone();
             let ha_client_setup = ha_client.clone();
             let device_cache_setup = device_cache.clone();
 
-            // Populate device cache from HA on startup
             tauri::async_runtime::spawn(async move {
+                // Detect external Ollama — reuse it if running, otherwise start managed.
+                // For HA we always start the managed instance (token must match Sierra's config),
+                // so kill any stale HA on :8123 first.
+                let ollama_external = pm_startup.detect_external_ollama().await;
+
+                if ollama_external {
+                    println!("[Ollama] detected external instance — skipping managed start");
+                    let mut svc = pm_startup.ollama.write().await;
+                    svc.is_external = true;
+                    svc.status = services::process_manager::ServiceStatus::External;
+                } else if let Err(e) = pm_startup.start_ollama().await {
+                    eprintln!("Failed to start Ollama: {}", e);
+                }
+
+                // Kill any HA already on :8123 so Sierra's managed instance can bind the port
+                if pm_startup.detect_external_ha().await {
+                    println!("[HA] stale instance found on :8123 — killing before managed start");
+                    services::process_manager::kill_process_on_port_8123();
+                }
+                if let Err(e) = pm_startup.start_ha().await {
+                    eprintln!("Failed to start Home Assistant: {}", e);
+                }
+
+                // Populate device cache and start WebSocket subscription
                 if ha_client_setup.is_healthy().await {
                     if let Ok(states) = ha_client_setup.get_all_states().await {
                         device_cache_setup.populate(states).await;
+                    }
+
+                    // Subscribe to real-time state changes via WebSocket
+                    let ws_client = services::ha_ws::HaWebSocketClient::new(&ha_url, &ha_token);
+                    let ws_cache = device_cache_setup.clone();
+                    match ws_client.subscribe(Arc::new(move |event| {
+                        let cache = ws_cache.clone();
+                        tokio::spawn(async move {
+                            cache.update_entity(&event.entity_id, event.new_state).await;
+                        });
+                    })).await {
+                        Ok(_handle) => println!("[ha-ws] Subscribed to real-time state changes"),
+                        Err(e) => eprintln!("[ha-ws] Failed to subscribe: {}", e),
                     }
                 }
             });

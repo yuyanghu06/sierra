@@ -85,7 +85,8 @@ impl DeviceStateCache {
         }
     }
 
-    /// Set room mappings.
+    /// Set room mappings (used when HA areas API is wired up).
+    #[allow(dead_code)]
     pub async fn set_rooms(&self, rooms: HashMap<String, Vec<String>>) {
         let mut r = self.rooms.write().await;
         *r = rooms;

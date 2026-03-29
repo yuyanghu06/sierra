@@ -15,11 +15,17 @@ export async function saveConfig(config: AppConfig): Promise<void> {
   return invoke("save_config", { config });
 }
 
+export type HaConnectionStatus =
+  | { status: "connected" }
+  | { status: "needsOnboarding" }
+  | { status: "invalidToken" }
+  | { status: "unreachable" };
+
 export async function testHaConnection(
   url: string,
   token: string,
-): Promise<boolean> {
-  return invoke<boolean>("test_ha_connection", { url, token });
+): Promise<HaConnectionStatus> {
+  return invoke<HaConnectionStatus>("test_ha_connection", { url, token });
 }
 
 export async function getActiveModel(): Promise<string | null> {
