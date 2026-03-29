@@ -361,6 +361,116 @@ impl ProcessManager {
 
         println!("[HA] starting Home Assistant...");
 
+        self.start_ha_inner().await
+    }
+
+    /// Windows: Home Assistant Core does not support native Windows.
+    /// It must run inside WSL (Windows Subsystem for Linux), which
+    /// auto-forwards port 8123 to the Windows localhost.
+    #[cfg(target_os = "windows")]
+    async fn start_ha_inner(&self) -> Result<(), String> {
+        // Verify WSL is usable
+        let wsl_ok = Command::new("wsl")
+            .args(["--", "echo", "ok"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !wsl_ok {
+            return Err(
+                "Home Assistant requires WSL on Windows. \
+                 Install it by running: wsl --install"
+                    .to_string(),
+            );
+        }
+
+        // Confirm HA is installed in the WSL venv
+        let ha_installed = Command::new("wsl")
+            .args(["--", "bash", "-c", "test -f ~/.sierra/ha-venv/bin/hass"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !ha_installed {
+            return Err(
+                "Home Assistant is not installed in WSL. \
+                 Please run the setup wizard."
+                    .to_string(),
+            );
+        }
+
+        {
+            let mut svc = self.home_assistant.write().await;
+            svc.status = ServiceStatus::Starting;
+        }
+
+        let log_path = self.log_dir.join("homeassistant.log");
+        println!("[HA] log:     {}", log_path.display());
+
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|e| format!("Failed to open log file: {}", e))?;
+
+        let log_file_err = log_file
+            .try_clone()
+            .map_err(|e| format!("Failed to clone log handle: {}", e))?;
+
+        // Run HA inside WSL — WSL2 auto-forwards port 8123 to Windows localhost
+        use std::os::windows::process::CommandExt;
+        let child = Command::new("wsl")
+            .args([
+                "--",
+                "bash",
+                "-c",
+                "mkdir -p ~/.sierra/ha-config && \
+                 exec ~/.sierra/ha-venv/bin/hass --config ~/.sierra/ha-config",
+            ])
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_file_err))
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .spawn()
+            .map_err(|e| format!("Failed to start Home Assistant via WSL: {}", e))?;
+
+        println!("[HA] spawned via WSL (pid: {})", child.id());
+
+        {
+            let mut svc = self.home_assistant.write().await;
+            svc.process = Some(child);
+        }
+
+        const TIMEOUT_SECS: u64 = 180;
+        println!("[HA] waiting for health check on :8123 (timeout: {TIMEOUT_SECS}s)...");
+
+        let healthy = self.wait_for_health("home_assistant", TIMEOUT_SECS).await;
+        {
+            let mut svc = self.home_assistant.write().await;
+            if healthy {
+                svc.status = ServiceStatus::Running;
+                println!("[HA] ✓ running");
+            } else {
+                svc.status = ServiceStatus::Crashed {
+                    exit_code: None,
+                    restarts: svc.restart_count,
+                };
+                eprintln!("[HA] ✗ failed to become healthy within {TIMEOUT_SECS}s");
+                eprintln!(
+                    "[HA]   check log: {}",
+                    self.log_dir.join("homeassistant.log").display()
+                );
+                return Err(format!(
+                    "Home Assistant failed to start within {TIMEOUT_SECS} seconds"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// macOS / Linux: run the hass binary directly from the managed venv.
+    #[cfg(not(target_os = "windows"))]
+    async fn start_ha_inner(&self) -> Result<(), String> {
         let binary = self
             .find_ha_binary()
             .ok_or_else(|| "Home Assistant not installed in managed venv".to_string())?;
@@ -389,8 +499,6 @@ impl ProcessManager {
             .try_clone()
             .map_err(|e| format!("Failed to clone log handle: {}", e))?;
 
-        let mut cmd = Command::new(&binary);
-
         // Build a clean PATH without entries containing spaces.
         // HA's internal pip/uv chokes on PATH entries with spaces (e.g., macOS
         // "Application Support") — it misparses them as package requirements.
@@ -408,6 +516,7 @@ impl ProcessManager {
             parts.join(":")
         };
 
+        let mut cmd = Command::new(&binary);
         cmd.arg("--config")
             .arg(&ha_config_dir)
             .env("PATH", &clean_path)
@@ -419,12 +528,6 @@ impl ProcessManager {
             .env_remove("PIP_CONSTRAINT")
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_file_err));
-
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
 
         let child = cmd
             .spawn()
