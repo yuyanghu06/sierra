@@ -28,6 +28,7 @@ pub async fn save_config(
         let ha_url = config
             .ha_url
             .clone()
+            .or_else(|| old_config.ha_url.clone())
             .unwrap_or_else(|| "http://localhost:8123".to_string());
         let ha_token = config.ha_token.clone().unwrap_or_default();
 

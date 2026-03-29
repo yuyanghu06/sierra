@@ -10,6 +10,8 @@ export interface DependencyStatus {
   pythonVersion: string | null;
   rustAvailable: boolean;
   rustVersion: string | null;
+  /** Windows only: false when WSL is not installed / no distro exists. Always true on macOS/Linux. */
+  wslAvailable: boolean;
 }
 
 export type InstallProgressEvent =
@@ -40,8 +42,26 @@ export type ServiceStatus =
   | { status: "crashed"; exitCode: number | null; restarts: number }
   | { status: "external" };
 
+export interface OllamaUpdateStatus {
+  updateAvailable: boolean;
+  currentVersion: string | null;
+  latestVersion: string | null;
+}
+
 export async function checkDependencies(): Promise<DependencyStatus> {
   return invoke("check_dependencies");
+}
+
+export async function checkOllamaUpdate(): Promise<OllamaUpdateStatus> {
+  return invoke("check_ollama_update");
+}
+
+export async function installWsl(
+  onProgress: (event: InstallProgressEvent) => void,
+): Promise<void> {
+  const channel = new Channel<InstallProgressEvent>();
+  channel.onmessage = onProgress;
+  return invoke("install_wsl", { onProgress: channel });
 }
 
 export async function installOllama(

@@ -1749,6 +1749,16 @@ select:focus-visible {
   font-weight: 500;
 }
 
+.setup-dep-restart {
+  font-size: 12px;
+  color: rgba(180, 100, 20, 0.9);
+  font-weight: 500;
+}
+
+.setup-dep-check-warn {
+  color: rgba(180, 100, 20, 0.9) !important;
+}
+
 .setup-dep-progress {
   margin-top: 10px;
   font-size: 12px;
@@ -1759,6 +1769,40 @@ select:focus-visible {
   margin-top: 10px;
   font-size: 12px;
   color: rgba(200, 60, 50, 0.85);
+}
+
+/* Restart-required banner */
+.setup-restart-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: rgba(224, 140, 40, 0.12);
+  border: 0.5px solid rgba(210, 140, 40, 0.35);
+}
+
+.setup-restart-icon {
+  font-size: 18px;
+  line-height: 1;
+  color: rgba(180, 100, 20, 0.9);
+  flex-shrink: 0;
+  padding-top: 1px;
+}
+
+.setup-restart-banner strong {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(60, 35, 15, 0.9);
+  margin-bottom: 4px;
+}
+
+.setup-restart-banner p {
+  margin: 0;
+  font-size: 12px;
+  color: rgba(100, 60, 15, 0.8);
+  line-height: 1.5;
 }
 
 /* Setup actions */

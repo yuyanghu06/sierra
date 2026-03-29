@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tauri::ipc::Channel;
 use tauri::Manager;
 
-use crate::services::installer::{self, DependencyStatus, InstallProgress, PullProgress};
+use crate::services::installer::{self, DependencyStatus, InstallProgress, OllamaUpdateStatus, PullProgress};
 use crate::services::process_manager::{ProcessManager, ServiceStatus};
 
 #[derive(Clone, serde::Serialize)]
@@ -26,6 +26,16 @@ pub async fn check_dependencies(app_handle: tauri::AppHandle) -> Result<Dependen
         status.python_available, status.rust_available
     );
     Ok(status)
+}
+
+#[tauri::command]
+pub async fn check_ollama_update() -> Result<OllamaUpdateStatus, String> {
+    Ok(installer::check_ollama_update().await)
+}
+
+#[tauri::command]
+pub async fn install_wsl(on_progress: Channel<InstallProgress>) -> Result<(), String> {
+    installer::install_wsl(&on_progress).await
 }
 
 #[tauri::command]
@@ -98,7 +108,9 @@ pub async fn restart_service(
 
 #[tauri::command]
 pub async fn start_services(
+    app_handle: tauri::AppHandle,
     pm: tauri::State<'_, Arc<ProcessManager>>,
+    state: tauri::State<'_, crate::state::AppState>,
 ) -> Result<ServiceStatusInfo, String> {
     // Reuse external Ollama if already running; otherwise start managed instance
     let ollama_external = pm.detect_external_ollama().await;
@@ -120,6 +132,18 @@ pub async fn start_services(
     match pm.start_ha().await {
         Ok(()) => {}
         Err(e) => eprintln!("Failed to start HA: {}", e),
+    }
+
+    // Persist the effective HA URL (may be WSL2 IP instead of localhost when
+    // Tailscale is active) so the HA REST client uses the right address.
+    let effective_url = pm.effective_ha_url.read().await.clone();
+    {
+        let mut cfg = state.config.write().await;
+        if cfg.ha_url.as_deref() != Some(&effective_url) {
+            println!("[setup] updating ha_url to effective address: {}", effective_url);
+            cfg.ha_url = Some(effective_url.clone());
+            let _ = crate::config::save_config(&app_handle, &cfg);
+        }
     }
 
     Ok(ServiceStatusInfo {

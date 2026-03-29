@@ -11,9 +11,10 @@ use tower_http::cors::CorsLayer;
 
 use crate::services::ha_client::HomeAssistantService;
 use crate::tools::registry;
+use tokio::sync::RwLock;
 
 pub struct McpServerState {
-    pub ha_client: Arc<dyn HomeAssistantService>,
+    pub ha_client: Arc<RwLock<Arc<dyn HomeAssistantService>>>,
 }
 
 #[derive(Serialize)]
@@ -98,6 +99,8 @@ async fn execute_tool(
 
     match state
         .ha_client
+        .read()
+        .await
         .call_service(&tool.domain, &tool.service, &entity_id, extra_data)
         .await
     {
@@ -227,7 +230,7 @@ mod tests {
 
     fn test_server(mock: MockHaService) -> TestServer {
         let state = Arc::new(McpServerState {
-            ha_client: Arc::new(mock),
+            ha_client: Arc::new(RwLock::new(Arc::new(mock) as Arc<dyn HomeAssistantService>)),
         });
         let app = create_router(state);
         TestServer::new(app).unwrap()

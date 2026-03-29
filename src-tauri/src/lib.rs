@@ -43,12 +43,16 @@ pub fn run() {
             let ha_client: Arc<dyn services::ha_client::HomeAssistantService> =
                 Arc::new(HaRestClient::new(ha_url.clone(), ha_token.clone()));
 
+            // Shared lock — AppState and McpServerState both hold a clone of this Arc,
+            // so writing to it (after startup determines the effective URL) updates both.
+            let ha_shared = Arc::new(RwLock::new(ha_client.clone()));
+
             let device_cache = devices::new_shared_cache();
             let tool_executor: Arc<dyn services::llm::ToolExecutor> =
                 Arc::new(HaToolExecutor::new(ha_client.clone()));
 
             let mcp_state = Arc::new(McpServerState {
-                ha_client: ha_client.clone(),
+                ha_client: ha_shared.clone(),
             });
 
             // Create the process manager
@@ -82,7 +86,7 @@ pub fn run() {
             app.manage(AppState {
                 conversation: Mutex::new(Vec::new()),
                 llm: RwLock::new(Box::new(ollama)),
-                ha: RwLock::new(ha_client.clone()),
+                ha: ha_shared.clone(),
                 device_cache: device_cache.clone(),
                 tool_executor: RwLock::new(tool_executor),
                 config: RwLock::new(cfg),
@@ -92,8 +96,8 @@ pub fn run() {
 
             // Start Ollama and Home Assistant on launch
             let pm_startup = process_manager.clone();
-            let ha_client_setup = ha_client.clone();
             let device_cache_setup = device_cache.clone();
+            let app_handle_startup = app.handle().clone();
 
             tauri::async_runtime::spawn(async move {
                 // Detect external Ollama — reuse it if running, otherwise start managed.
@@ -119,14 +123,39 @@ pub fn run() {
                     eprintln!("Failed to start Home Assistant: {}", e);
                 }
 
+                // After HA starts, effective_ha_url reflects the URL that actually worked
+                // (may be WSL2 IP instead of localhost when Tailscale is active).
+                // Rebuild the HA client and update AppState + config so every caller
+                // uses the correct address.
+                let effective_url = pm_startup.effective_ha_url.read().await.clone();
+                let state = app_handle_startup.state::<AppState>();
+                let current_token = state.config.read().await.ha_token.clone().unwrap_or_default();
+
+                let ha_client_final: Arc<dyn services::ha_client::HomeAssistantService> =
+                    Arc::new(HaRestClient::new(effective_url.clone(), current_token.clone()));
+
+                // Persist effective URL and update live client if it changed
+                {
+                    let mut cfg = state.config.write().await;
+                    if cfg.ha_url.as_deref() != Some(&effective_url) {
+                        println!("[startup] ha_url updated to effective address: {}", effective_url);
+                        cfg.ha_url = Some(effective_url.clone());
+                        let _ = config::save_config(&app_handle_startup, &cfg);
+                    }
+                }
+                let new_executor: Arc<dyn services::llm::ToolExecutor> =
+                    Arc::new(HaToolExecutor::new(ha_client_final.clone()));
+                *state.ha.write().await = ha_client_final.clone();
+                *state.tool_executor.write().await = new_executor;
+
                 // Populate device cache and start WebSocket subscription
-                if ha_client_setup.is_healthy().await {
-                    if let Ok(states) = ha_client_setup.get_all_states().await {
+                if ha_client_final.is_healthy().await {
+                    if let Ok(states) = ha_client_final.get_all_states().await {
                         device_cache_setup.populate(states).await;
                     }
 
                     // Subscribe to real-time state changes via WebSocket
-                    let ws_client = services::ha_ws::HaWebSocketClient::new(&ha_url, &ha_token);
+                    let ws_client = services::ha_ws::HaWebSocketClient::new(&effective_url, &current_token);
                     let ws_cache = device_cache_setup.clone();
                     match ws_client.subscribe(Arc::new(move |event| {
                         let cache = ws_cache.clone();
@@ -185,6 +214,8 @@ pub fn run() {
             commands::settings::test_ha_connection,
             commands::settings::get_active_model,
             commands::setup::check_dependencies,
+            commands::setup::check_ollama_update,
+            commands::setup::install_wsl,
             commands::setup::install_ollama,
             commands::setup::install_python,
             commands::setup::install_rust,

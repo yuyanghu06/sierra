@@ -1,32 +1,37 @@
 import { useState, useEffect, useRef } from "react";
 import {
   checkDependencies,
+  checkOllamaUpdate,
+  installWsl,
   installOllama,
   installPython,
   installRust,
   installHomeAssistant,
   pullModel,
   startServices,
-  testHaConnection,
   type DependencyStatus,
+  type OllamaUpdateStatus,
   type InstallProgressEvent,
   type PullProgressEvent,
   type HaConnectionStatus,
 } from "../commands/setup";
 import { listModels } from "../commands/chat";
-import { saveConfig, getConfig } from "../commands/config";
+import { saveConfig, getConfig, testHaConnection as testHaConnectionDirect } from "../commands/config";
 import { checkHaHealth } from "../commands/devices";
 
 type SetupStep = "check" | "install" | "ha-onboarding" | "model" | "done";
 
 const DEFAULT_MODEL = "qwen3.5:4b";
-const DEFAULT_HA_URL = "http://localhost:8123";
 
 export default function SetupView({ onComplete }: { onComplete: () => void }) {
   const [step, setStep] = useState<SetupStep>("check");
   const [deps, setDeps] = useState<DependencyStatus | null>(null);
 
   // Install step
+  const [wslInstalling, setWslInstalling] = useState(false);
+  const [wslProgress, setWslProgress] = useState("");
+  const [wslError, setWslError] = useState<string | null>(null);
+  const [wslRestartRequired, setWslRestartRequired] = useState(false);
   const [pythonInstalling, setPythonInstalling] = useState(false);
   const [pythonProgress, setPythonProgress] = useState("");
   const [pythonError, setPythonError] = useState<string | null>(null);
@@ -36,11 +41,13 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
   const [ollamaInstalling, setOllamaInstalling] = useState(false);
   const [ollamaProgress, setOllamaProgress] = useState("");
   const [ollamaError, setOllamaError] = useState<string | null>(null);
+  const [ollamaUpdateStatus, setOllamaUpdateStatus] = useState<OllamaUpdateStatus | null>(null);
   const [haInstalling, setHaInstalling] = useState(false);
   const [haProgress, setHaProgress] = useState("");
   const [haError, setHaError] = useState<string | null>(null);
 
   // HA onboarding step
+  const [haUrl, setHaUrl] = useState("http://localhost:8123");
   const [haStarting, setHaStarting] = useState(false);
   const [haLive, setHaLive] = useState(false);
   const [haToken, setHaToken] = useState("");
@@ -85,11 +92,9 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
     try {
       const status = await checkDependencies();
       setDeps(status);
-      if (status.ollamaInstalled && status.homeAssistantInstalled &&
-          status.pythonAvailable && status.rustAvailable) {
-        setStep("ha-onboarding");
-      } else {
-        setStep("install");
+      setStep("install");
+      if (status.ollamaInstalled) {
+        checkOllamaUpdate().then(setOllamaUpdateStatus).catch(() => {});
       }
     } catch {
       setDeps(null);
@@ -102,6 +107,9 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
     setHaLive(false);
     try {
       await startServices();
+      // Read effective HA URL from config — may be WSL2 IP if localhost forwarding is broken
+      const cfg = await getConfig();
+      if (cfg.ha_url) setHaUrl(cfg.ha_url);
     } catch {
       // ignore — HA may already be starting from app launch
     }
@@ -169,6 +177,28 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
     }
   }
 
+  async function handleInstallWsl() {
+    setWslInstalling(true);
+    setWslProgress("Starting...");
+    setWslError(null);
+    setWslRestartRequired(false);
+    try {
+      await installWsl((event: InstallProgressEvent) => {
+        if (event.event === "started") setWslProgress("Starting WSL installation…");
+        else if (event.event === "installing") setWslProgress("Installing WSL (a UAC prompt may appear)…");
+        else if (event.event === "completed") {
+          setWslProgress("Installed — restart required");
+          setWslRestartRequired(true);
+        }
+        else if (event.event === "failed") { setWslError(event.data.error); setWslProgress(""); }
+      });
+    } catch (e) {
+      setWslError(String(e));
+      setWslProgress("");
+    }
+    setWslInstalling(false);
+  }
+
   async function handleInstallPython() {
     setPythonInstalling(true);
     setPythonProgress("Starting...");
@@ -216,7 +246,12 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
         if (event.event === "started") setOllamaProgress("Starting installation...");
         else if (event.event === "downloading") setOllamaProgress(`Downloading… ${Math.round(event.data.percent)}%`);
         else if (event.event === "installing") setOllamaProgress("Installing...");
-        else if (event.event === "completed") { setOllamaProgress("Installed"); setDeps((d) => d ? { ...d, ollamaInstalled: true } : d); }
+        else if (event.event === "completed") {
+          setOllamaProgress("Installed");
+          setDeps((d) => d ? { ...d, ollamaInstalled: true } : d);
+          setOllamaUpdateStatus(null);
+          checkOllamaUpdate().then(setOllamaUpdateStatus).catch(() => {});
+        }
         else if (event.event === "failed") { setOllamaError(event.data.error); setOllamaProgress(""); }
       });
     } catch (e) {
@@ -234,7 +269,7 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
       await installHomeAssistant((event: InstallProgressEvent) => {
         if (event.event === "started") setHaProgress("Starting installation...");
         else if (event.event === "downloading") setHaProgress(`Installing packages… ${Math.round(event.data.percent)}%`);
-        else if (event.event === "installing") setHaProgress("Creating virtual environment...");
+        else if (event.event === "installing") setHaProgress("Installing system dependencies...");
         else if (event.event === "configuring") setHaProgress("Configuring...");
         else if (event.event === "completed") { setHaProgress("Installed"); setDeps((d) => d ? { ...d, homeAssistantInstalled: true } : d); }
         else if (event.event === "failed") { setHaError(event.data.error); setHaProgress(""); }
@@ -251,7 +286,7 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
     setTokenTesting(true);
     setTokenStatus(null);
     try {
-      const result = await testHaConnection(DEFAULT_HA_URL, haToken.trim());
+      const result = await testHaConnectionDirect(haUrl, haToken.trim());
       setTokenStatus(result);
     } catch {
       setTokenStatus({ status: "unreachable" });
@@ -261,7 +296,7 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
 
   async function handleSaveTokenAndContinue() {
     const cfg = await getConfig();
-    await saveConfig({ ...cfg, ha_url: DEFAULT_HA_URL, ha_token: haToken.trim() });
+    await saveConfig({ ...cfg, ha_url: haUrl, ha_token: haToken.trim() });
     setStep("model");
   }
 
@@ -300,7 +335,7 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
   }
 
   const bothInstalled = deps?.ollamaInstalled && deps?.homeAssistantInstalled &&
-    deps?.pythonAvailable && deps?.rustAvailable;
+    deps?.pythonAvailable && deps?.rustAvailable && deps?.wslAvailable;
   const tokenConnected = tokenStatus?.status === "connected";
 
   return (
@@ -325,6 +360,30 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
         {/* Install dependencies */}
         {step === "install" && (
           <div className="setup-body">
+            {/* WSL — only shown when not already available (Windows without WSL) */}
+            {deps && !deps.wslAvailable && (
+              <SetupDep
+                name="WSL (Windows Subsystem for Linux)"
+                desc="Required to run Home Assistant on Windows"
+                installed={false}
+                installing={wslInstalling}
+                progress={wslProgress}
+                error={wslError}
+                onInstall={handleInstallWsl}
+                restartRequired={wslRestartRequired}
+              />
+            )}
+
+            {wslRestartRequired && (
+              <div className="setup-restart-banner">
+                <span className="setup-restart-icon">⚠</span>
+                <div>
+                  <strong>Restart required</strong>
+                  <p>WSL was installed but needs a system restart to finish setup. Save your work, restart your computer, then reopen Sierra.</p>
+                </div>
+              </div>
+            )}
+
             <SetupDep
               name="Python 3.12"
               desc="Required for Home Assistant"
@@ -351,6 +410,9 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
               progress={ollamaProgress}
               error={ollamaError}
               onInstall={handleInstallOllama}
+              updateAvailable={ollamaUpdateStatus?.updateAvailable}
+              latestVersion={ollamaUpdateStatus?.latestVersion ?? undefined}
+              currentVersion={ollamaUpdateStatus?.currentVersion ?? undefined}
             />
             <SetupDep
               name="Home Assistant"
@@ -398,11 +460,11 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
                       <li>
                         Open{" "}
                       <a
-                          href={DEFAULT_HA_URL}
+                          href={haUrl}
                           className="setup-link"
                           onClick={(e) => e.preventDefault()}
                         >
-                          {DEFAULT_HA_URL}
+                          {haUrl}
                         </a>{" "}
                         in your browser
                       </li>
@@ -440,9 +502,9 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
                   {tokenStatus && (
                     <div className={`setup-token-status ${tokenConnected ? "setup-token-status-ok" : tokenStatus.status === "needsOnboarding" ? "setup-token-status-warn" : "setup-token-status-err"}`}>
                       {tokenConnected && "✓ Connected — Sierra can reach Home Assistant"}
-                      {tokenStatus.status === "needsOnboarding" && `Complete setup at ${DEFAULT_HA_URL} first, then generate a token`}
+                      {tokenStatus.status === "needsOnboarding" && `Complete setup at ${haUrl} first, then generate a token`}
                       {tokenStatus.status === "invalidToken" && "Token not recognised — make sure you copied the full token"}
-                      {tokenStatus.status === "unreachable" && `Home Assistant isn't responding at ${DEFAULT_HA_URL}`}
+                      {tokenStatus.status === "unreachable" && `Home Assistant isn't responding at ${haUrl}`}
                     </div>
                   )}
                 </>
@@ -532,7 +594,8 @@ export default function SetupView({ onComplete }: { onComplete: () => void }) {
 /* ── Sub-components ────────────────────────────────────────────────────────── */
 
 function SetupDep({
-  name, desc, installed, installing, progress, error, onInstall, disabled, disabledReason,
+  name, desc, installed, installing, progress, error, onInstall, disabled, disabledReason, restartRequired,
+  updateAvailable, latestVersion, currentVersion,
 }: {
   name: string;
   desc: string;
@@ -543,26 +606,44 @@ function SetupDep({
   onInstall: () => void;
   disabled?: boolean;
   disabledReason?: string;
+  restartRequired?: boolean;
+  updateAvailable?: boolean;
+  latestVersion?: string;
+  currentVersion?: string;
 }) {
   return (
     <div className="setup-dep">
       <div className="setup-dep-row">
         <div className="setup-dep-info">
-          <span className={`setup-dep-check ${installed ? "setup-dep-check-ok" : ""}`}>
-            {installed ? "✓" : "•"}
+          <span className={`setup-dep-check ${installed && !updateAvailable ? "setup-dep-check-ok" : restartRequired ? "setup-dep-check-warn" : updateAvailable ? "setup-dep-check-warn" : ""}`}>
+            {installed && !updateAvailable ? "✓" : restartRequired ? "↻" : updateAvailable ? "↑" : "•"}
           </span>
           <div>
             <span className="setup-dep-name">{name}</span>
-            <span className="setup-dep-desc">{desc}</span>
+            <span className="setup-dep-desc">
+              {updateAvailable
+                ? `Update available: ${currentVersion} → ${latestVersion}`
+                : desc}
+            </span>
           </div>
         </div>
-        {!installed ? (
+        {restartRequired ? (
+          <span className="setup-dep-restart">Restart required</span>
+        ) : !installed ? (
           <button
             className="form-btn form-btn-primary"
             onClick={onInstall}
             disabled={installing || disabled}
           >
             {installing ? "Installing…" : "Install"}
+          </button>
+        ) : updateAvailable ? (
+          <button
+            className="form-btn form-btn-primary"
+            onClick={onInstall}
+            disabled={installing}
+          >
+            {installing ? "Updating…" : "Update"}
           </button>
         ) : (
           <span className="setup-dep-installed">Installed</span>

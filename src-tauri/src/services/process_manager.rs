@@ -7,6 +7,18 @@ use tokio::sync::RwLock;
 
 use crate::util::HideConsole;
 
+/// Returns the WSL2 VM's first IPv4 address by running `hostname -I` inside WSL.
+/// Used on Windows as a fallback when Tailscale breaks localhost port forwarding.
+#[cfg(target_os = "windows")]
+fn get_wsl2_ip() -> Option<String> {
+    let output = Command::new("wsl")
+        .args(["--", "bash", "-c", "hostname -I"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.split_whitespace().next().map(|s| s.to_string())
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", tag = "status")]
 pub enum ServiceStatus {
@@ -35,6 +47,9 @@ pub struct ManagedService {
 pub struct ProcessManager {
     pub ollama: RwLock<ManagedService>,
     pub home_assistant: RwLock<ManagedService>,
+    /// The URL that actually reached HA after startup (may differ from localhost
+    /// on Windows/WSL2 when Tailscale breaks localhost port forwarding).
+    pub effective_ha_url: RwLock<String>,
     app_data_dir: PathBuf,
     ha_venv_dir: PathBuf,
     log_dir: PathBuf,
@@ -62,6 +77,7 @@ impl ProcessManager {
                 restart_count: 0,
                 is_external: false,
             }),
+            effective_ha_url: RwLock::new("http://localhost:8123".to_string()),
             app_data_dir,
             ha_venv_dir,
             log_dir,
@@ -83,21 +99,41 @@ impl ProcessManager {
             .unwrap_or(false)
     }
 
-    /// Check if Home Assistant is healthy on its port
+    /// Check if Home Assistant is healthy on its port.
+    /// On Windows/WSL2, Tailscale can break localhost port forwarding — if
+    /// localhost:8123 fails, we fall back to the WSL2 VM's direct IP and store
+    /// whichever URL actually works as `effective_ha_url`.
     pub async fn check_ha_health(&self) -> bool {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
             .build()
             .unwrap_or_default();
 
-        // HA returns 401 when running but needs auth — that still means it's alive
-        match client.get("http://localhost:8123/api/").send().await {
-            Ok(r) => {
-                let status = r.status().as_u16();
-                status == 200 || status == 401 || status == 403
+        let is_alive = |status: u16| status == 200 || status == 401 || status == 403;
+
+        // Try localhost first (works on macOS/Linux and most Windows setups)
+        if let Ok(r) = client.get("http://localhost:8123/api/").send().await {
+            if is_alive(r.status().as_u16()) {
+                *self.effective_ha_url.write().await = "http://localhost:8123".to_string();
+                return true;
             }
-            Err(_) => false,
         }
+
+        // Fallback: get WSL2 VM IP and try that directly (Windows + Tailscale)
+        #[cfg(target_os = "windows")]
+        if let Some(wsl_ip) = get_wsl2_ip() {
+            let url = format!("http://{}:8123/api/", wsl_ip);
+            if let Ok(r) = client.get(&url).send().await {
+                if is_alive(r.status().as_u16()) {
+                    let base = format!("http://{}:8123", wsl_ip);
+                    println!("[HA] localhost unreachable, using WSL2 IP: {}", base);
+                    *self.effective_ha_url.write().await = base;
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
 }
@@ -318,7 +354,12 @@ impl ProcessManager {
         let mut cmd = Command::new(binary);
         cmd.arg("serve")
             .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(log_file_err));
+            .stderr(Stdio::from(log_file_err))
+            // Instruct Ollama to use all available GPUs. OLLAMA_NUM_GPU=-1 means
+            // "use all layers on GPU". CUDA_VISIBLE_DEVICES=all ensures CUDA-capable
+            // GPUs are not hidden. These are no-ops if no GPU is present.
+            .env("OLLAMA_NUM_GPU", "-1")
+            .env("CUDA_VISIBLE_DEVICES", "all");
 
         #[cfg(target_os = "windows")]
         {

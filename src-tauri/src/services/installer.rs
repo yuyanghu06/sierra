@@ -34,6 +34,9 @@ pub struct DependencyStatus {
     pub python_version: Option<String>,
     pub rust_available: bool,
     pub rust_version: Option<String>,
+    /// Windows only: whether WSL is installed and a default distro is available.
+    /// Always `true` on macOS/Linux (WSL is not applicable).
+    pub wsl_available: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -72,6 +75,24 @@ pub fn detect_dependencies(app_data_dir: &PathBuf) -> DependencyStatus {
         python_version,
         rust_available,
         rust_version,
+        wsl_available: detect_wsl(),
+    }
+}
+
+/// Returns `true` if WSL is installed and usable. Always `true` on non-Windows.
+pub fn detect_wsl() -> bool {
+    #[cfg(not(target_os = "windows"))]
+    return true;
+
+    #[cfg(target_os = "windows")]
+    {
+        // `wsl -- echo ok` succeeds only when WSL is installed and a default distro exists.
+        Command::new("wsl")
+            .args(["--", "echo", "ok"])
+            .hide_console()
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 }
 
@@ -125,21 +146,18 @@ fn detect_ha(_app_data_dir: &PathBuf) -> (bool, Option<String>) {
     {
         let check = Command::new("wsl")
             .args(["--", "bash", "-c", "test -f ~/.sierra/ha-venv/bin/hass"])
+            .hide_console()
             .output();
         return match check {
             Ok(output) => (output.status.success(), None),
-            Err(_) => (false, None), // WSL not available or not installed
+            Err(_) => (false, None),
         };
     }
 
-    // macOS / Linux: check the managed venv first, then system PATH.
+    // macOS / Linux: check managed venv first, then system PATH.
     #[cfg(not(target_os = "windows"))]
     {
         let venv = ha_venv_dir();
-
-        #[cfg(target_os = "macos")]
-        let hass = venv.join("bin/hass");
-        #[cfg(not(target_os = "macos"))]
         let hass = venv.join("bin/hass");
 
         if hass.exists() {
@@ -149,7 +167,7 @@ fn detect_ha(_app_data_dir: &PathBuf) -> (bool, Option<String>) {
                     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     (true, if version.is_empty() { None } else { Some(version) })
                 }
-                _ => (true, None), // Binary exists even if --version fails
+                _ => (true, None),
             };
         }
 
@@ -168,32 +186,6 @@ fn detect_ha(_app_data_dir: &PathBuf) -> (bool, Option<String>) {
                                 String::from_utf8_lossy(&ver_output.stdout).trim().to_string();
                             return (true, if version.is_empty() { None } else { Some(version) });
                         }
-    let hass = venv.join("Scripts\\hass.exe");
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let hass = venv.join("bin/hass");
-
-    if hass.exists() {
-        let result = Command::new(&hass).arg("--version").hide_console().output();
-        return match result {
-            Ok(output) if output.status.success() => {
-                let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                (true, if version.is_empty() { None } else { Some(version) })
-            }
-            _ => (true, None), // Binary exists even if --version fails
-        };
-    }
-
-    // 2. Check system PATH
-    let check_cmd = if cfg!(target_os = "windows") { "where" } else { "which" };
-    if let Ok(output) = Command::new(check_cmd).arg("hass").hide_console().output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).lines().next().unwrap_or("").trim().to_string();
-            if !path.is_empty() {
-                // Found on PATH — try to get version
-                if let Ok(ver_output) = Command::new(&path).arg("--version").hide_console().output() {
-                    if ver_output.status.success() {
-                        let version = String::from_utf8_lossy(&ver_output.stdout).trim().to_string();
-                        return (true, if version.is_empty() { None } else { Some(version) });
                     }
                     return (true, None);
                 }
@@ -206,7 +198,18 @@ fn detect_ha(_app_data_dir: &PathBuf) -> (bool, Option<String>) {
 
 fn detect_python() -> (bool, Option<String>) {
     if let Some(cmd) = find_python_3_10_plus() {
-        if let Ok(output) = Command::new(&cmd).arg("--version").hide_console().output() {
+        // `find_python_3_10_plus` may return "py:-3.X" on Windows (py launcher + version flag).
+        // Split that into binary + args before invoking; `Command::new("py:-3.13")` would fail.
+        let output = if let Some((launcher, ver_flag)) = cmd.split_once(':') {
+            Command::new(launcher)
+                .args([ver_flag, "--version"])
+                .hide_console()
+                .output()
+        } else {
+            Command::new(&cmd).arg("--version").hide_console().output()
+        };
+
+        if let Ok(output) = output {
             if output.status.success() {
                 let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let version = if version.is_empty() {
@@ -418,6 +421,121 @@ fn find_python_3_10_plus() -> Option<String> {
     None
 }
 
+/// Fetch the latest published Ollama version tag from GitHub releases.
+/// Returns `None` if the network request fails (non-fatal).
+pub async fn fetch_latest_ollama_version() -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("sierra-app")
+        .build()
+        .ok()?;
+
+    let resp = client
+        .get("https://api.github.com/repos/ollama/ollama/releases/latest")
+        .send()
+        .await
+        .ok()?;
+
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let tag = json["tag_name"].as_str()?;
+    // Tags are "v0.x.x" — strip the leading 'v'
+    Some(tag.trim_start_matches('v').to_string())
+}
+
+/// Parse a version string like "ollama version is 0.6.5" or "0.6.5" into (major, minor, patch).
+fn parse_ollama_version(s: &str) -> Option<(u32, u32, u32)> {
+    let s = s.to_lowercase();
+    let s = s.trim_start_matches("ollama version is ").trim();
+    let s = s.trim_start_matches('v');
+    let mut parts = s.splitn(3, '.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().unwrap_or("0").split_whitespace().next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OllamaUpdateStatus {
+    pub update_available: bool,
+    pub current_version: Option<String>,
+    pub latest_version: Option<String>,
+}
+
+/// Check whether the installed Ollama is older than the latest GitHub release.
+pub async fn check_ollama_update() -> OllamaUpdateStatus {
+    let (installed, current_version) = detect_ollama();
+
+    if !installed {
+        return OllamaUpdateStatus {
+            update_available: false,
+            current_version: None,
+            latest_version: None,
+        };
+    }
+
+    let latest_version = fetch_latest_ollama_version().await;
+
+    let update_available = match (&current_version, &latest_version) {
+        (Some(cur), Some(lat)) => {
+            match (parse_ollama_version(cur), parse_ollama_version(lat)) {
+                (Some(cv), Some(lv)) => lv > cv,
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+
+    OllamaUpdateStatus {
+        update_available,
+        current_version,
+        latest_version,
+    }
+}
+
+/// Install WSL (Windows only). Launches `wsl --install` elevated via PowerShell.
+/// A reboot may be required after installation completes.
+/// On non-Windows this is a no-op that immediately returns `Ok(())`.
+pub async fn install_wsl(on_progress: &Channel<InstallProgress>) -> Result<(), String> {
+    let _ = on_progress.send(InstallProgress::Started {
+        service: "WSL".to_string(),
+    });
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = on_progress.send(InstallProgress::Completed);
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = on_progress.send(InstallProgress::Installing);
+
+        // Run `wsl --install` elevated through PowerShell so the UAC prompt appears.
+        // `-Wait` blocks until installation finishes before returning.
+        let output = tokio::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Process -FilePath 'wsl' -ArgumentList '--install' -Verb RunAs -Wait",
+            ])
+            .hide_console()
+            .output()
+            .await
+            .map_err(|e| format!("Failed to launch WSL installer: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let _ = on_progress.send(InstallProgress::Failed { error: stderr.clone() });
+            return Err(format!("WSL installation failed: {}", stderr));
+        }
+
+        let _ = on_progress.send(InstallProgress::Completed);
+        Ok(())
+    }
+}
+
 /// Install Ollama
 pub async fn install_ollama(on_progress: &Channel<InstallProgress>) -> Result<(), String> {
     let _ = on_progress.send(InstallProgress::Started {
@@ -556,10 +674,40 @@ async fn install_home_assistant_wsl(on_progress: &Channel<InstallProgress>) -> R
         return Err(err);
     }
 
-    let _ = on_progress.send(InstallProgress::Installing);
+    // Check if python3 venv support is already available. If not, install
+    // python3.12-venv via apt. Force IPv4 to avoid hangs on systems where DNS
+    // returns IPv6 addresses but IPv6 connectivity is unavailable (e.g. WSL
+    // behind Tailscale). Skip apt entirely if venv already works — avoids
+    // blocking on apt locks left by previous runs or other processes.
+    let venv_check = tokio::process::Command::new("wsl")
+        .args(["--", "bash", "-c", "python3 -m venv --help > /dev/null 2>&1"])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
 
-    // Create the venv and install HA in a single bash invocation.
-    // Pin pycares to avoid aiodns/DNS resolver errors on some Linux kernels.
+    if !venv_check {
+        let _ = on_progress.send(InstallProgress::Installing);
+
+        let apt_script = "\
+            sudo apt-get update -qq -o Acquire::ForceIPv4=true 2>/dev/null && \
+            sudo apt-get install -y -qq -o Acquire::ForceIPv4=true python3.12-venv 2>/dev/null";
+
+        let apt_out = tokio::process::Command::new("wsl")
+            .args(["--", "bash", "-c", apt_script])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to install python3.12-venv: {}", e))?;
+
+        if !apt_out.status.success() {
+            let stderr = String::from_utf8_lossy(&apt_out.stderr).to_string();
+            let _ = on_progress.send(InstallProgress::Failed { error: stderr.clone() });
+            return Err(format!("apt install failed: {}", stderr));
+        }
+    }
+
+    // Create the venv and install HA. Pin pycares to avoid aiodns/DNS resolver
+    // errors on some Linux kernels.
     let install_script = "\
         set -e && \
         python3 -m venv ~/.sierra/ha-venv && \
